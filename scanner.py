@@ -16,12 +16,11 @@ def send_telegram(message):
     requests.post(url, json=payload)
 
 today = datetime.today().strftime("%Y%m%d")
-start_w = (datetime.today() - timedelta(days=480)).strftime("%Y%m%d")
-start_d = (datetime.today() - timedelta(days=50)).strftime("%Y%m%d")
+# 150거래일(30주) 확보를 위해 300일 전부터 일봉 데이터 수집
+start_date = (datetime.today() - timedelta(days=320)).strftime("%Y%m%d")
 
-print(f"[*] {today} 전종목 전수 스크리닝 시작...")
+print(f"[*] {today} 30주선(150일선) 스크리닝 가동...")
 
-# 1. 코스피 / 코스닥 전종목 수집
 kospi = stock.get_market_ticker_list(today, market="KOSPI")
 kosdaq = stock.get_market_ticker_list(today, market="KOSDAQ")
 tickers = kospi + kosdaq
@@ -37,54 +36,46 @@ SECTORS = {
 
 results = []
 
-# 전종목 대상 순회 (시총/거래량 유효 종목 중심)
 for t in tickers:
     try:
-        # 일봉 데이터 30일치 먼저 확인
-        df_d = stock.get_market_ohlcv_by_date(start_d, today, t)
-        if len(df_d) < 22:
+        # 일봉 데이터 한 번에 수집 (주봉 30주선 = 일봉 150일선)
+        df = stock.get_market_ohlcv_by_date(start_date, today, t)
+        if len(df) < 160:
             continue
         
-        # 관리종목/동전주 배제 (최근 종가 1,000원 이상, 당일 거래대금 최소 확인)
-        cp = df_d['종가'].iloc[-1]
+        cp = df['종가'].iloc[-1]
         if cp < 1000:
             continue
 
-        # 주봉 30주선(SMA 30) 수집
-        df_w = stock.get_market_ohlcv_by_date(start_w, today, t, "m")
-        if len(df_w) < 32:
-            continue
+        # 30주선(150일 단순이동평균) 계산
+        df['SMA150'] = df['종가'].rolling(150).mean()
+        s30 = df['SMA150'].iloc[-1]
+        p_s30 = df['SMA150'].iloc[-20] # 4주(20거래일) 전 30주선
 
-        df_w['SMA30'] = df_w['종가'].rolling(30).mean()
-        s30 = df_w['SMA30'].iloc[-1]
-        p_s30 = df_w['SMA30'].iloc[-4] # 3~4주 전 대비
-
-        # [필터 1] 30주선 기울기 우상향 또는 수평 (하향 추세는 완전 배제)
+        # 1. 30주선 우상향 또는 보합 검증
         if np.isnan(s30) or np.isnan(p_s30) or s30 < (p_s30 * 0.995):
             continue
 
-        # [필터 2] 30주선 풀백 구간 (-3% ~ +7% 이내 밀착 지지)
+        # 2. 30주선 풀백 구간 (-3% ~ +8% 이내 지지)
         disp = (cp / s30) * 100.0
-        if not (97.0 <= disp <= 107.0):
+        if not (97.0 <= disp <= 108.0):
             continue
 
-        # [필터 3] 일봉 거래량 수렴/절벽 확인 (20일 평균 거래량 대비 80% 이하)
-        v_avg = df_d['거래량'].iloc[-21:-1].mean()
-        t_vol = df_d['거래량'].iloc[-1]
+        # 3. 거래량 절벽 검증 (20일 평균 대비 90% 이하)
+        v_avg = df['거래량'].iloc[-21:-1].mean()
+        t_vol = df['거래량'].iloc[-1]
         v_rat = t_vol / v_avg if v_avg > 0 else 1.0
-        
-        if v_rat > 0.80:
+        if v_rat > 0.90:
             continue
 
-        # 최근 5거래일 연기금/기관 순매수 수집
+        # 최근 5거래일 연기금 순매수
         df_net = stock.get_market_net_purchases_of_equities_by_ticker(
-            df_d.index[-5].strftime("%Y%m%d"), today, "ALL", t
+            df.index[-5].strftime("%Y%m%d"), today, "ALL", t
         )
         p_net = df_net.loc[t, "연기금"] if t in df_net.index else 0
-        inst_net = df_net.loc[t, "기관합계"] if t in df_net.index else 0
 
         name = stock.get_market_ticker_name(t)
-        sec = SECTORS.get(t, "일반/제조")
+        sec = SECTORS.get(t, "기타/제조")
 
         results.append({
             "name": name,
@@ -92,29 +83,27 @@ for t in tickers:
             "price": int(cp),
             "disp": round(disp, 1),
             "v_rat": round(v_rat, 2),
-            "p_net": int(p_net),
-            "inst_net": int(inst_net)
+            "p_net": int(p_net)
         })
 
     except Exception:
         continue
 
-# 텔레그램 발송 메시지 구성
+# 텔레그램 메시지 구성
 msg = f"📊 *[{today} 스탠 와인스타인 30주선 A포인트 리포트]*\n"
-msg += f"- 전체 시장 스캔 포착: *{len(results)}개*\n"
+msg += f"- 시장 전체 스캔 포착: *{len(results)}개*\n"
 msg += "--------------------------------------\n"
 
 if results:
-    df = pd.DataFrame(results).sort_values(by=["sector", "v_rat"])
-    # 섹터별로 그룹핑하여 출력
-    for sec, grp in df.groupby("sector"):
-        msg += f"\n📁 *[{sec}]* ({len(grp)}종목)\n"
-        for _, r in grp.head(5).iterrows(): # 섹터별 최대 5개 압축
+    df_res = pd.DataFrame(results).sort_values(by=["sector", "v_rat"])
+    for sec, grp in df_res.groupby("sector"):
+        msg += f"\n📁 *[{sec}]* ({len(grp)}개)\n"
+        for _, r in grp.head(5).iterrows():
             p_sign = "+" if r['p_net'] > 0 else ""
             msg += f"• *{r['name']}* (`{r['price']:,}원`)\n"
             msg += f"   - 30주선 이격: `{r['disp']}%` | 거래량: 평소의 `{int(r['v_rat']*100)}%`\n"
             msg += f"   - 연기금 5일: `{p_sign}{r['p_net']:,}주`\n"
 else:
-    msg += "오늘 30주선 풀백 조건을 충족하는 종목이 없습니다."
+    msg += "오늘 30주선 풀백 조건을 만족하는 종목이 없습니다."
 
 send_telegram(msg)
