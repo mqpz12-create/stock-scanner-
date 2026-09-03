@@ -35,7 +35,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 한국거래소 공식 업종(Sector) 연동 스캔 시작...")
+log(f"[*] {today_str} 전 종목 실시간 자동 업종 매칭 스캔 시작...")
 
 # 1. KOSPI 벤치마크
 try:
@@ -44,66 +44,61 @@ try:
 except Exception:
     kospi_close = None
 
-# 2. 거래소 공식 업종(KRX-DESC) 마스터 테이블 로드
-try:
-    df_desc = fdr.StockListing('KRX-DESC')
-    # Symbol(종목코드), Sector(공식업종), Industry(주요제품)
-    code_to_sector = dict(zip(df_desc['Symbol'], df_desc['Sector'].fillna('')))
-    code_to_ind = dict(zip(df_desc['Symbol'], df_desc['Industry'].fillna('')))
-except Exception as e:
-    log(f"[!] KRX-DESC 로드 실패: {e}")
-    code_to_sector = {}
-    code_to_ind = {}
-
-# 3. 시가총액 상위 종목 수집
 df_krx = fdr.StockListing('KRX')
 if 'Marcap' in df_krx.columns:
     df_krx = df_krx[df_krx['Marcap'] >= 500_0000_0000]
 
 target_tickers = list(df_krx.sort_values(by='Marcap', ascending=False)['Code'].head(400))
-must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220"]
+must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340"]
 target_tickers = list(set(target_tickers + must_have))
-
-# 거래소 공식 표준산업분류 기반 6대 실전 섹터 판정 함수
-def classify_official_sector(code, name):
-    sec = code_to_sector.get(code, "")
-    ind = code_to_ind.get(code, "")
-    full_text = f"{sec} {ind} {name}".lower()
-
-    if any(k in full_text for k in ["반도체", "전자부품", "집적회로", "다이오드", "웨이퍼"]):
-        return "반도체/소부장"
-    elif any(k in full_text for k in ["절연선", "케이블", "광통신", "전기 가스", "증기", "발전", "전력", "에너지"]):
-        return "전력인프라/광통신"
-    elif any(k in full_text for k in ["의약품", "의약물질", "바이오", "의료", "병원"]):
-        return "바이오/헬스케어"
-    elif any(k in full_text for k in ["특수 목적용 기계", "무기", "항공", "우주", "선박", "철도", "플랜트"]):
-        return "기계/플랜트/방산"
-    elif any(k in full_text for k in ["축전지", "일차전지", "화학물질", "배터리", "석유정제"]):
-        return "화학/배터리"
-    elif any(k in full_text for k in ["금융업", "신탁업", "지주회사", "보험", "증권"]):
-        return "금융/지주"
-    
-    # 그 외 일반 제조
-    return "일반/제조"
 
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
 
+# 네이버 모바일 통합 API (공식 업종명 자동 추출)
+def get_stock_official_sector(code, default_name=""):
+    try:
+        url = f"https://m.stock.naver.com/api/stock/{code}/integration"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=3)
+        if res.status_code == 200:
+            data = res.json()
+            # 네이버 공식 업종명 (WICS 표준분류)
+            ind_name = data.get('industryCodeName', '')
+            if ind_name:
+                txt = (ind_name + " " + default_name).lower()
+                if any(k in txt for k in ["반도체", "전자장비", "it하드웨어", "전자부품"]):
+                    return "반도체/소부장"
+                elif any(k in txt for k in ["통신장비", "전기유틸리티", "전력", "가스유틸리티", "에너지"]):
+                    return "전력인프라/광통신"
+                elif any(k in txt for k in ["제약", "바이오", "생명과학", "건강관리"]):
+                    return "바이오/헬스케어"
+                elif any(k in txt for k in ["기계", "조선", "우주항공", "국방", "건설"]):
+                    return "방산/원자력/우주"
+                elif any(k in txt for k in ["화학", "전기제품", "배터리", "이차전지"]):
+                    return "2차전지/소재"
+                elif any(k in txt for k in ["은행", "증권", "보험", "지주", "금융"]):
+                    return "금융/보험/지주"
+                elif any(k in txt for k in ["자동차", "자동차부품"]):
+                    return "자동차/부품"
+                return f"{ind_name}"
+    except Exception:
+        pass
+    return "일반/제조"
+
+# 네이버 매매동향 API
 def get_investor_trend(code):
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=5&page=1"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)',
-            'Referer': 'https://m.stock.naver.com/'
-        }
-        res = requests.get(url, headers=headers, timeout=4)
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=headers, timeout=3)
         if res.status_code != 200:
             return "⚪️ 수급 공방 (중립)", 3
             
         data = res.json()
         trends = data.get('message', []) if isinstance(data, dict) and 'message' in data else data
-        if not trends or len(trends) == 0:
+        if not trends:
             return "⚪️ 수급 공방 (중립)", 3
 
         inst_sum = 0
@@ -144,7 +139,7 @@ def analyze_stock(code):
         sma30 = df_w['SMA30'].iloc[-1]
         prev_sma30 = df_w['SMA30'].iloc[-5]
 
-        # 1. 30주선 우상향/보합 확인
+        # 1. 30주선 우상향 확인
         if np.isnan(sma30) or np.isnan(prev_sma30) or sma30 < (prev_sma30 * 0.995):
             return None
 
@@ -200,15 +195,15 @@ def analyze_stock(code):
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 6. 수급 분석
+        # 6. 네이버 API 수급 분석
         investor_tag, investor_score = get_investor_trend(code)
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
         name = name.replace("[", "").replace("]", "").replace("*", "")
         
-        # 거래소 공식 업종 기반 분류
-        sector = classify_official_sector(code, name)
+        # 7. 네이버 API 공식 업종 자동 추출
+        sector = get_stock_official_sector(code, name)
 
         if 99.0 <= disp <= 103.0:
             tag = "30주선 초밀착"
@@ -256,9 +251,6 @@ msg += f"• 조건 충족 종목수: 총 {len(results)}개\n"
 if results:
     df_res = pd.DataFrame(results)
 
-    # 섹터별 평균 RS 계산
-    sec_rs_mean = df_res.groupby('sector')['m_rs'].mean().to_dict()
-
     final_results = []
     for _, r in df_res.iterrows():
         score = 0
@@ -270,11 +262,10 @@ if results:
         else: score += 0
 
         # 2) 섹터 프리미엄 (15점)
-        sec_mean = sec_rs_mean.get(r['sector'], 0.0)
-        if r['sector'] in ["반도체/소부장", "전력인프라/광통신", "기계/플랜트/방산"] or sec_mean >= 15.0:
+        if r['sector'] in ["반도체/소부장", "전력인프라/광통신", "방산/원자력/우주", "2차전지/소재"]:
             score += 15
             sec_badge = "🔥 핵심주도섹터"
-        elif r['sector'] != "일반/제조":
+        elif r['sector'] not in ["일반/제조"]:
             score += 10
             sec_badge = "🟢 테마섹터"
         else:
@@ -302,7 +293,7 @@ if results:
     df_res = pd.DataFrame(final_results)
 
     # 1. 주도 섹터 대장주 선별
-    df_themed = df_res[df_res['sector'] != "일반/제조"]
+    df_themed = df_res[df_res['sector'].isin(["반도체/소부장", "전력인프라/광통신", "방산/원자력/우주", "2차전지/소재"])]
     top_sector_leader = None
     if not df_themed.empty:
         top_sector_leader = df_themed.sort_values(by=['score', 'm_rs'], ascending=[False, False]).iloc[0]
@@ -340,7 +331,7 @@ if results:
         msg += f"   - 모바일차트: {chart_url_i}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    # 전체 리스트 브리핑 (점수 높은 순 정렬)
+    # 전체 리스트 브리핑 (섹터 내 점수 높은 순 정렬)
     df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False])
     for sec, grp in df_sorted.groupby("sector", sort=False):
         msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
@@ -358,4 +349,4 @@ else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 거래소 공식 업종 기반 발송 완료")
+log("[*] 전 종목 자동 매칭 스캔 완료")
