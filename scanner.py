@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import FinanceDataReader as fdr
 
-# 실시간 출력을 위해 버퍼 강제 비우기
 def log(text):
     print(text, flush=True)
 
@@ -25,11 +24,11 @@ def send_telegram(message):
         log(f"[!] 텔레그램 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-start_str = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+# 30주선 확보를 위해 60주(약 420일) 전 일봉부터 수집
+start_str = (datetime.today() - timedelta(days=450)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 기준 초고속 스크리닝 시작...")
+log(f"[*] {today_str} 기준 MTS 일치형 주봉 30주선 스캔 시작...")
 
-# 1. KRX 전 종목 리스트 수집
 df_krx = fdr.StockListing('KRX')
 if 'Marcap' in df_krx.columns:
     df_krx = df_krx[df_krx['Marcap'] >= 500_0000_0000]
@@ -47,36 +46,50 @@ SECTORS = {
     "012330": "자동차", "005380": "자동차", "003030": "철강/소재"
 }
 
-# 개별 종목 분석 함수
 def analyze_stock(code):
     try:
-        df = fdr.DataReader(code, start_str)
-        if len(df) < 140:
+        df_d = fdr.DataReader(code, start_str)
+        if len(df_d) < 150:
             return None
 
-        close_price = int(df['Close'].iloc[-1])
-        if close_price < 1000:
+        # 1. HTS/MTS와 동일한 주봉(Weekly) 캔들 생성 (금요일 마감 기준)
+        df_w = df_d.resample('W-FRI').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last',
+            'Volume': 'sum'
+        }).dropna()
+
+        if len(df_w) < 35:
             return None
 
-        # 30주선 (150일 단순이평)
-        df['SMA150'] = df['Close'].rolling(150, min_periods=100).mean()
-        sma150 = df['SMA150'].iloc[-1]
-        prev_sma150 = df['SMA150'].iloc[-20]
+        # 2. 주봉 30주선(SMA 30) 및 20주선 정밀 계산
+        df_w['SMA30'] = df_w['Close'].rolling(30).mean()
+        
+        current_price = int(df_d['Close'].iloc[-1])
+        sma30 = df_w['SMA30'].iloc[-1]
+        prev_sma30 = df_w['SMA30'].iloc[-5] # 4~5주 전 30주선
 
-        # 조건 1: 30주선 우상향/보합
-        if np.isnan(sma150) or np.isnan(prev_sma150) or sma150 < (prev_sma150 * 0.99):
+        # 필터 1: 30주선 우상향 또는 수평 지지 (하향 추세 배제)
+        if np.isnan(sma30) or np.isnan(prev_sma30) or sma30 < (prev_sma30 * 0.995):
             return None
 
-        # 조건 2: 30주선 풀백 (-4% ~ +9%)
-        disp = (close_price / sma150) * 100.0
-        if not (96.0 <= disp <= 109.0):
+        # 필터 2: 30주선 풀백 구간 (-3% ~ +8% 지지)
+        disp = (current_price / sma30) * 100.0
+        if not (97.0 <= disp <= 108.0):
+            continue_flag = False
+        else:
+            continue_flag = True
+            
+        if not continue_flag:
             return None
 
-        # 조건 3: 거래량 수렴 (20일 평균 대비 95% 이하)
-        v_avg = df['Volume'].iloc[-21:-1].mean()
-        t_vol = df['Volume'].iloc[-1]
+        # 필터 3: 일봉 거래량 절벽 (최근 20거래일 평균 대비 90% 이하 수렴)
+        v_avg = df_d['Volume'].iloc[-21:-1].mean()
+        t_vol = df_d['Volume'].iloc[-1]
         vol_ratio = (t_vol / v_avg) if v_avg > 0 else 1.0
-        if vol_ratio > 0.95:
+        if vol_ratio > 0.90:
             return None
 
         name_match = df_krx[df_krx['Code'] == code]
@@ -87,8 +100,8 @@ def analyze_stock(code):
             "code": code,
             "name": name,
             "sector": sector,
-            "price": close_price,
-            "sma150": int(sma150),
+            "price": current_price,
+            "sma30": int(round(sma30)),
             "disp": round(disp, 1),
             "vol_ratio": round(vol_ratio, 2)
         }
@@ -96,25 +109,19 @@ def analyze_stock(code):
         return None
 
 results = []
-log(f"[*] 총 {len(target_tickers)}개 종목 초고속 병렬 스캔 시작...")
+log(f"[*] 총 {len(target_tickers)}개 종목 MTS 동기화 주봉 스캔 중...")
 
-# 15개 스레드로 동시 병렬 처리 (1분 이내 완료)
 with ThreadPoolExecutor(max_workers=15) as executor:
     future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
-    completed = 0
     for future in as_completed(future_to_code):
-        completed += 1
-        if completed % 50 == 0 or completed == len(target_tickers):
-            log(f" -> 진행률: {completed}/{len(target_tickers)} 완료")
         res = future.result()
         if res:
             results.append(res)
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-# 텔레그램 메시지 구성
-msg = f"📊 *[{today_str} 스탠 와인스타인 30주선 A포인트 리포트]*\n"
-msg += f"- 포착 종목수: *{len(results)}개*\n"
+msg = f"📊 *[{today_str} MTS 동기화 30주선 A포인트 리포트]*\n"
+msg += f"- 실전 주봉 30주선 포착: *{len(results)}개*\n"
 msg += "--------------------------------------\n"
 
 if results:
@@ -123,10 +130,10 @@ if results:
         msg += f"\n📁 *[{sec}]* ({len(grp)}개)\n"
         for _, r in grp.head(5).iterrows():
             msg += f"• *{r['name']}* (`{r['price']:,}원`)\n"
-            msg += f"   - 30주선: `{r['sma150']:,}원` (이격: `{r['disp']}%`)\n"
-            msg += f"   - 거래량 마름: 평소의 `{int(r['vol_ratio']*100)}%`\n"
+            msg += f"   - 주봉 30주선: `{r['sma30']:,}원` (이격: `{r['disp']}%`)\n"
+            msg += f"   - 일봉 거래량비: 평소의 `{int(r['vol_ratio']*100)}%`\n"
 else:
-    msg += "오늘 30주선 풀백 조건을 만족하는 종목이 없습니다."
+    msg += "오늘 주봉 30주선 지지 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
 log("[*] 텔레그램 전송 완료!")
