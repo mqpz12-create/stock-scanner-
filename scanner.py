@@ -35,7 +35,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 정밀 Mansfield RS & 네이버 공식 API 매매동향 스캔 시작...")
+log(f"[*] {today_str} 한국거래소 공식 업종(Sector) 연동 스캔 시작...")
 
 # 1. KOSPI 벤치마크
 try:
@@ -44,28 +44,52 @@ try:
 except Exception:
     kospi_close = None
 
+# 2. 거래소 공식 업종(KRX-DESC) 마스터 테이블 로드
+try:
+    df_desc = fdr.StockListing('KRX-DESC')
+    # Symbol(종목코드), Sector(공식업종), Industry(주요제품)
+    code_to_sector = dict(zip(df_desc['Symbol'], df_desc['Sector'].fillna('')))
+    code_to_ind = dict(zip(df_desc['Symbol'], df_desc['Industry'].fillna('')))
+except Exception as e:
+    log(f"[!] KRX-DESC 로드 실패: {e}")
+    code_to_sector = {}
+    code_to_ind = {}
+
+# 3. 시가총액 상위 종목 수집
 df_krx = fdr.StockListing('KRX')
 if 'Marcap' in df_krx.columns:
     df_krx = df_krx[df_krx['Marcap'] >= 500_0000_0000]
 
 target_tickers = list(df_krx.sort_values(by='Marcap', ascending=False)['Code'].head(400))
-must_have = ["005090", "065060", "094480", "327260", "010140", "028050"]
+must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220"]
 target_tickers = list(set(target_tickers + must_have))
 
-SECTORS = {
-    "005090": "에너지/전력망", "065060": "에너지/전력망", "094480": "에너지/전력망",
-    "267260": "신재생/에너지", "009830": "신재생/태양광", "051910": "신재생/화학",
-    "327260": "반도체/광통신", "010140": "반도체/광통신", "000660": "반도체/AI", "005930": "반도체/AI",
-    "105560": "금융/지주", "055550": "금융/지주", "086790": "금융/지주", "005830": "금융/보험",
-    "028050": "플랜트/건설", "000210": "플랜트/건설", "028670": "해운/인프라",
-    "012330": "자동차", "005380": "자동차", "003030": "철강/소재"
-}
+# 거래소 공식 표준산업분류 기반 6대 실전 섹터 판정 함수
+def classify_official_sector(code, name):
+    sec = code_to_sector.get(code, "")
+    ind = code_to_ind.get(code, "")
+    full_text = f"{sec} {ind} {name}".lower()
+
+    if any(k in full_text for k in ["반도체", "전자부품", "집적회로", "다이오드", "웨이퍼"]):
+        return "반도체/소부장"
+    elif any(k in full_text for k in ["절연선", "케이블", "광통신", "전기 가스", "증기", "발전", "전력", "에너지"]):
+        return "전력인프라/광통신"
+    elif any(k in full_text for k in ["의약품", "의약물질", "바이오", "의료", "병원"]):
+        return "바이오/헬스케어"
+    elif any(k in full_text for k in ["특수 목적용 기계", "무기", "항공", "우주", "선박", "철도", "플랜트"]):
+        return "기계/플랜트/방산"
+    elif any(k in full_text for k in ["축전지", "일차전지", "화학물질", "배터리", "석유정제"]):
+        return "화학/배터리"
+    elif any(k in full_text for k in ["금융업", "신탁업", "지주회사", "보험", "증권"]):
+        return "금융/지주"
+    
+    # 그 외 일반 제조
+    return "일반/제조"
 
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
 
-# 네이버 모바일 공식 증권 API로 외인/기관 5일 순매수 수집
 def get_investor_trend(code):
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=5&page=1"
@@ -75,32 +99,31 @@ def get_investor_trend(code):
         }
         res = requests.get(url, headers=headers, timeout=4)
         if res.status_code != 200:
-            return "⚪️ 수급 분석 중립", 5
+            return "⚪️ 수급 공방 (중립)", 3
             
         data = res.json()
         trends = data.get('message', []) if isinstance(data, dict) and 'message' in data else data
         if not trends or len(trends) == 0:
-            return "⚪️ 수급 분석 중립", 5
+            return "⚪️ 수급 공방 (중립)", 3
 
         inst_sum = 0
         frgn_sum = 0
         for item in trends[:5]:
-            # 순매수량 환산
             inst_sum += int(str(item.get('institutionPureBuyQuant', '0')).replace(',', ''))
             frgn_sum += int(str(item.get('foreignerPureBuyQuant', '0')).replace(',', ''))
 
         if inst_sum > 0 and frgn_sum > 0:
-            return f"🔥 외인·기관 쌍끌이 (+{inst_sum+frgn_sum:,}주)", 15
+            return f"🔥 외인·기관 쌍끌이 (+{inst_sum+frgn_sum:,}주)", 6
         elif inst_sum > 0 and frgn_sum <= 0:
-            return f"⭐️ 기관 집중 매집 (+{inst_sum:,}주)", 10
+            return f"⭐️ 기관 집중 매집 (+{inst_sum:,}주)", 5
         elif frgn_sum > 0 and inst_sum <= 0:
-            return f"💎 외국인 집중 매집 (+{frgn_sum:,}주)", 10
+            return f"💎 외국인 집중 매집 (+{frgn_sum:,}주)", 5
         elif inst_sum < 0 and frgn_sum < 0:
             return "⚠️ 개인 홀로 매수 (외인·기관 동반 매도)", 0
         else:
-            return "⚪️ 수급 공방 (중립)", 5
+            return "⚪️ 수급 공방 (중립)", 3
     except Exception:
-        return "⚪️ 수급 공방 (중립)", 5
+        return "⚪️ 수급 공방 (중립)", 3
 
 def analyze_stock(code):
     try:
@@ -108,7 +131,7 @@ def analyze_stock(code):
         if len(df_d) < 180 or kospi_close is None:
             return None
 
-        # 키움 MTS 일치 주봉 30주선
+        # 키움 일치 주봉 30주선 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -121,7 +144,7 @@ def analyze_stock(code):
         sma30 = df_w['SMA30'].iloc[-1]
         prev_sma30 = df_w['SMA30'].iloc[-5]
 
-        # 1. 30주선 우상향/보합
+        # 1. 30주선 우상향/보합 확인
         if np.isnan(sma30) or np.isnan(prev_sma30) or sma30 < (prev_sma30 * 0.995):
             return None
 
@@ -140,7 +163,7 @@ def analyze_stock(code):
         if vol_ratio_sma20 > 90.0:
             return None
 
-        # 4. 정통 52주 Mansfield RS 및 세분화 등급 판정
+        # 4. 정통 52주 Mansfield Relative Strength
         df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
         if len(df_rs) >= 120:
             rs_line = df_rs['stock'] / df_rs['kospi']
@@ -150,12 +173,11 @@ def analyze_stock(code):
         else:
             m_rs = 0.0
 
-        # RS 계층화
         if m_rs >= 40.0:
             rs_tag = f"👑 시장 최상위 슈퍼스톡 (Mansfield +{m_rs:.1f})"
-        elif m_rs >= 25.0:
+        elif m_rs >= 20.0:
             rs_tag = f"🔥 시장 압도적 주도주 (Mansfield +{m_rs:.1f})"
-        elif m_rs >= 12.0:
+        elif m_rs >= 5.0:
             rs_tag = f"🚀 지수 대비 강세 돌파 (Mansfield +{m_rs:.1f})"
         elif m_rs >= 0.0:
             rs_tag = f"🟢 지수 대비 우위/견조 (Mansfield +{m_rs:.1f})"
@@ -168,49 +190,25 @@ def analyze_stock(code):
         recent_20 = df_d.iloc[-20:]
         range_20 = (recent_20['High'].max() - recent_20['Low'].min()) / current_price * 100.0
         
-        is_flag = False
+        pattern_score = 1
         if range_5 <= 6.0 and vol_ratio_sma20 <= 65.0:
             pattern_tag = "상승깃발형 (변동폭 축소+거래량 절벽)"
-            is_flag = True
+            pattern_score = 4
         elif range_5 < (range_20 * 0.45):
             pattern_tag = "삼각수렴 지지 (에너지 응축)"
+            pattern_score = 3
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 6. 매매동향 API 호출
+        # 6. 수급 분석
         investor_tag, investor_score = get_investor_trend(code)
-
-        # 종합 스코어링 (100점 만점)
-        score = 0
-        # Mansfield RS 점수 (35점)
-        if m_rs >= 40.0: score += 35
-        elif m_rs >= 25.0: score += 30
-        elif m_rs >= 12.0: score += 25
-        elif m_rs >= 0.0: score += 18
-        else: score += 5
-
-        # 30주선 지지 완성도 (25점)
-        if 99.5 <= disp <= 102.5: score += 25
-        elif 98.0 <= disp <= 104.5: score += 18
-        else: score += 10
-
-        # 거래량 마름 (15점)
-        if vol_ratio_sma20 <= 45.0: score += 15
-        elif vol_ratio_sma20 <= 65.0: score += 11
-        else: score += 6
-
-        # 수급 점수 (15점)
-        score += investor_score
-
-        # 패턴 점수 (10점)
-        if is_flag: score += 10
-        elif "삼각수렴" in pattern_tag: score += 7
-        else: score += 3
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
         name = name.replace("[", "").replace("]", "").replace("*", "")
-        sector = SECTORS.get(code, "일반/기타")
+        
+        # 거래소 공식 업종 기반 분류
+        sector = classify_official_sector(code, name)
 
         if 99.0 <= disp <= 103.0:
             tag = "30주선 초밀착"
@@ -231,10 +229,11 @@ def analyze_stock(code):
             "vol_ratio_sma20": round(vol_ratio_sma20, 1),
             "tag": tag,
             "pattern": pattern_tag,
+            "pattern_score": pattern_score,
             "rs": rs_tag,
             "m_rs": m_rs,
             "investor": investor_tag,
-            "score": score
+            "investor_score": investor_score
         }
     except Exception:
         return None
@@ -257,12 +256,56 @@ msg += f"• 조건 충족 종목수: 총 {len(results)}개\n"
 if results:
     df_res = pd.DataFrame(results)
 
-    # 1. 주도 섹터 대장주
-    df_themed = df_res[df_res['sector'] != "일반/기타"]
+    # 섹터별 평균 RS 계산
+    sec_rs_mean = df_res.groupby('sector')['m_rs'].mean().to_dict()
+
+    final_results = []
+    for _, r in df_res.iterrows():
+        score = 0
+        # 1) Mansfield RS (30점)
+        if r['m_rs'] >= 40.0: score += 30
+        elif r['m_rs'] >= 20.0: score += 25
+        elif r['m_rs'] >= 5.0: score += 20
+        elif r['m_rs'] >= 0.0: score += 14
+        else: score += 0
+
+        # 2) 섹터 프리미엄 (15점)
+        sec_mean = sec_rs_mean.get(r['sector'], 0.0)
+        if r['sector'] in ["반도체/소부장", "전력인프라/광통신", "기계/플랜트/방산"] or sec_mean >= 15.0:
+            score += 15
+            sec_badge = "🔥 핵심주도섹터"
+        elif r['sector'] != "일반/제조":
+            score += 10
+            sec_badge = "🟢 테마섹터"
+        else:
+            score += 5
+            sec_badge = "⚪️ 개별주"
+
+        # 3) 30주선 지지 완성도 (25점)
+        if 99.0 <= r['disp'] <= 102.5: score += 25
+        elif 98.0 <= r['disp'] <= 104.5: score += 18
+        else: score += 10
+
+        # 4) 거래량 마름 (20점)
+        if r['vol_ratio_sma20'] <= 45.0: score += 20
+        elif r['vol_ratio_sma20'] <= 65.0: score += 15
+        else: score += 8
+
+        # 5) 수급 & 패턴 보너스 (10점)
+        score += r['investor_score'] + r['pattern_score']
+
+        r_dict = dict(r)
+        r_dict['score'] = score
+        r_dict['sec_badge'] = sec_badge
+        final_results.append(r_dict)
+
+    df_res = pd.DataFrame(final_results)
+
+    # 1. 주도 섹터 대장주 선별
+    df_themed = df_res[df_res['sector'] != "일반/제조"]
     top_sector_leader = None
     if not df_themed.empty:
-        leading_sec = df_themed['sector'].value_counts().index[0]
-        top_sector_leader = df_themed[df_themed['sector'] == leading_sec].sort_values(by=['score', 'm_rs'], ascending=[False, False]).iloc[0]
+        top_sector_leader = df_themed.sort_values(by=['score', 'm_rs'], ascending=[False, False]).iloc[0]
 
     # 2. 독자 돌파 개별 초강세주 (Mansfield RS 1위)
     df_indie = df_res[df_res['code'] != (top_sector_leader['code'] if top_sector_leader is not None else "")]
@@ -274,42 +317,45 @@ if results:
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     if top_sector_leader is not None:
         bar_t = make_vol_bar(top_sector_leader['vol_ratio_sma20'])
-        msg += f"🏆 주도섹터 최우선 대장주\n"
+        chart_url_t = f"https://m.stock.naver.com/domestic/stock/{top_sector_leader['code']}/total"
+        msg += f"🏆 주도섹터 최우선 대장주 ({top_sector_leader['sec_badge']})\n"
         msg += f"▶ {top_sector_leader['name']} ({top_sector_leader['price']:,}원) [{top_sector_leader['sector']} | 와인스타인 {top_sector_leader['score']}점]\n"
         msg += f"   - 수급주체: {top_sector_leader['investor']}\n"
         msg += f"   - 상대강도: {top_sector_leader['rs']}\n"
         msg += f"   - 패턴: {top_sector_leader['pattern']}\n"
         msg += f"   - 30주선: {top_sector_leader['sma30']:,}원 (이격: {top_sector_leader['disp']}%)\n"
         msg += f"   - 거래량: 20일이평비 {top_sector_leader['vol_ratio_sma20']}% [{bar_t}] (전일비: {top_sector_leader['vol_ratio_prev']}%)\n"
-        msg += f"   - 차트: https://m.stock.naver.com/item/{top_sector_leader['code']}\n\n"
+        msg += f"   - 모바일차트: {chart_url_t}\n\n"
 
     if indie_alpha is not None:
         bar_i = make_vol_bar(indie_alpha['vol_ratio_sma20'])
+        chart_url_i = f"https://m.stock.naver.com/domestic/stock/{indie_alpha['code']}/total"
         msg += f"⚡️ 독자 돌파 개별 초강세주 (Mansfield RS 1위)\n"
         msg += f"▶ {indie_alpha['name']} ({indie_alpha['price']:,}원) [{indie_alpha['sector']} | 와인스타인 {indie_alpha['score']}점]\n"
         msg += f"   - 수급주체: {indie_alpha['investor']}\n"
         msg += f"   - 상대강도: {indie_alpha['rs']}\n"
         msg += f"   - 패턴: {indie_alpha['pattern']}\n"
         msg += f"   - 30주선: {indie_alpha['sma30']:,}원 (이격: {indie_alpha['disp']}%)\n"
-        msg += f"   - 20일이평비: {indie_alpha['vol_ratio_sma20']}% [{bar_i}]\n"
-        msg += f"   - 차트: https://m.stock.naver.com/item/{indie_alpha['code']}\n"
+        msg += f"   - 거래량: 20일이평비 {indie_alpha['vol_ratio_sma20']}% [{bar_i}]\n"
+        msg += f"   - 모바일차트: {chart_url_i}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    # 전체 리스트 브리핑 (Mansfield RS 순 정렬)
-    df_sorted = df_res.sort_values(by=["sector", "m_rs"], ascending=[True, False])
-    for sec, grp in df_sorted.groupby("sector"):
+    # 전체 리스트 브리핑 (점수 높은 순 정렬)
+    df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False])
+    for sec, grp in df_sorted.groupby("sector", sort=False):
         msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
         for _, r in grp.iterrows():
             bar = make_vol_bar(r['vol_ratio_sma20'])
+            chart_url = f"https://m.stock.naver.com/domestic/stock/{r['code']}/total"
             msg += f"• {r['name']} ({r['price']:,}원) [{r['score']}점 | {r['tag']}]\n"
             msg += f"   - 수급: {r['investor']}\n"
             msg += f"   - 상대강도: {r['rs']}\n"
             msg += f"   - 패턴: {r['pattern']}\n"
             msg += f"   - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 20일이평비: {r['vol_ratio_sma20']}% [{bar}]\n"
             msg += f"   - 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n"
-            msg += f"   - 차트: https://m.stock.naver.com/item/{r['code']}\n"
+            msg += f"   - 차트보기: {chart_url}\n"
 else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 텔레그램 발송 완료")
+log("[*] 거래소 공식 업종 기반 발송 완료")
