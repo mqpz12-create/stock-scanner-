@@ -35,9 +35,9 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 전 종목 실시간 자동 업종 매칭 스캔 시작...")
+log(f"[*] {today_str} 전 종목 로컬 지능형 자동 매칭 스캔 시작...")
 
-# 1. KOSPI 벤치마크
+# 1. KOSPI 지수
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
     kospi_close = df_kospi['Close']
@@ -52,46 +52,73 @@ target_tickers = list(df_krx.sort_values(by='Marcap', ascending=False)['Code'].h
 must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340"]
 target_tickers = list(set(target_tickers + must_have))
 
+# 100% 로컬 판정: 한국 증시 전 종목 자동 매칭 엔진 (네트워크 차단 영향 없음)
+def auto_classify_sector(code, name):
+    nm = name.replace(" ", "")
+    
+    # 1. 반도체 / AI / 소부장 (삼성전자, 하이닉스, 스퀘어, HPSP, 피에스케이, 제주반도체, 티씨케이 등)
+    if any(k in nm for k in [
+        "삼성전자", "하이닉스", "스퀘어", "반도체", "칩스", "웨이퍼", "소부장", "테크", "하이텍", 
+        "hpsp", "피에스케이", "케이씨텍", "티씨케이", "티엘비", "이오테크닉스", "머트리얼즈", "머티리얼즈",
+        "동진쎄미켐", "유진테크", "원익", "리노공업", "가온칩스", "코미코", "제이앤티씨", "두산테스나",
+        "디엔에프", "오픈엣지", "퀄리타스", "에이직", "하나마이크론", "네패스", "한미반도체", "에스앤에스텍"
+    ]):
+        return "반도체/AI/소부장"
+
+    # 2. 전력망 / 광통신 / 신재생 (대한광통신, SGC에너지, SK이터닉스, 전선, LS 등)
+    if any(k in nm for k in [
+        "광통신", "전선", "전력", "에너지", "이터닉스", "케이블", "그린", "태양광", "풍력",
+        "가온전선", "대한전선", "ls", "한국전력", "한전", "일진전기", "효성중공업", "제룡전기", "세명전기"
+    ]):
+        return "전력망/광통신/에너지"
+
+    # 3. 방산 / 원자력 / 우주항공 / 플랜트
+    if any(k in nm for k in [
+        "에어로", "항공", "방산", "우주", "에너빌리티", "넥스원", "카이", "로템", "한화시스템",
+        "원자력", "플랜트", "엔지니어링", "삼성e&a", "두산", "한국항공우주"
+    ]):
+        return "방산/원자력/우주"
+
+    # 4. 바이오 / 제약 / 헬스케어
+    if any(k in nm for k in [
+        "바이오", "제약", "파마", "메디", "약품", "로직스", "셀트리온", "알테오젠", "유한양행",
+        "에스티팜", "리가켐", "삼천당", "한미약품", "대웅제약", "케어", "헬스케어"
+    ]):
+        return "바이오/헬스케어"
+
+    # 5. 2차전지 / 배터리 / 핵심소재
+    if any(k in nm for k in [
+        "배터리", "이차전지", "리튬", "에코프로", "포스코퓨처엠", "엘앤에프", "엔솔", "sdi",
+        "화학", "후성", "나노신소재", "대주전자재료", "코스모", "천보", "더블유씨피"
+    ]):
+        return "2차전지/배터리"
+
+    # 6. 금융 / 보험 / 지주사
+    if any(k in nm for k in [
+        "금융", "지주", "홀딩스", "생명", "화재", "보험", "증권", "은행", "카드", "캐피탈"
+    ]):
+        return "금융/보험/지주"
+
+    # 7. 자동차 / 부품 / 로봇
+    if any(k in nm for k in [
+        "현대차", "기아", "모비스", "글로비스", "오토", "타이어", "로봇", "로보틱스", "만도"
+    ]):
+        return "자동차/로봇/모빌리티"
+
+    return "일반/제조"
+
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
 
-# 네이버 모바일 통합 API (공식 업종명 자동 추출)
-def get_stock_official_sector(code, default_name=""):
-    try:
-        url = f"https://m.stock.naver.com/api/stock/{code}/integration"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers, timeout=3)
-        if res.status_code == 200:
-            data = res.json()
-            # 네이버 공식 업종명 (WICS 표준분류)
-            ind_name = data.get('industryCodeName', '')
-            if ind_name:
-                txt = (ind_name + " " + default_name).lower()
-                if any(k in txt for k in ["반도체", "전자장비", "it하드웨어", "전자부품"]):
-                    return "반도체/소부장"
-                elif any(k in txt for k in ["통신장비", "전기유틸리티", "전력", "가스유틸리티", "에너지"]):
-                    return "전력인프라/광통신"
-                elif any(k in txt for k in ["제약", "바이오", "생명과학", "건강관리"]):
-                    return "바이오/헬스케어"
-                elif any(k in txt for k in ["기계", "조선", "우주항공", "국방", "건설"]):
-                    return "방산/원자력/우주"
-                elif any(k in txt for k in ["화학", "전기제품", "배터리", "이차전지"]):
-                    return "2차전지/소재"
-                elif any(k in txt for k in ["은행", "증권", "보험", "지주", "금융"]):
-                    return "금융/보험/지주"
-                elif any(k in txt for k in ["자동차", "자동차부품"]):
-                    return "자동차/부품"
-                return f"{ind_name}"
-    except Exception:
-        pass
-    return "일반/제조"
-
-# 네이버 매매동향 API
+# 매매동향 API (헤더 보강으로 차단 방지)
 def get_investor_trend(code):
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=5&page=1"
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://m.stock.naver.com/'
+        }
         res = requests.get(url, headers=headers, timeout=3)
         if res.status_code != 200:
             return "⚪️ 수급 공방 (중립)", 3
@@ -195,15 +222,15 @@ def analyze_stock(code):
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 6. 네이버 API 수급 분석
+        # 6. 수급 분석
         investor_tag, investor_score = get_investor_trend(code)
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
         name = name.replace("[", "").replace("]", "").replace("*", "")
         
-        # 7. 네이버 API 공식 업종 자동 추출
-        sector = get_stock_official_sector(code, name)
+        # 로컬 자동 매칭 엔진 실행 (통신 에러 원천 차단)
+        sector = auto_classify_sector(code, name)
 
         if 99.0 <= disp <= 103.0:
             tag = "30주선 초밀착"
@@ -262,7 +289,7 @@ if results:
         else: score += 0
 
         # 2) 섹터 프리미엄 (15점)
-        if r['sector'] in ["반도체/소부장", "전력인프라/광통신", "방산/원자력/우주", "2차전지/소재"]:
+        if r['sector'] in ["반도체/AI/소부장", "전력망/광통신/에너지", "방산/원자력/우주", "2차전지/배터리"]:
             score += 15
             sec_badge = "🔥 핵심주도섹터"
         elif r['sector'] not in ["일반/제조"]:
@@ -293,7 +320,7 @@ if results:
     df_res = pd.DataFrame(final_results)
 
     # 1. 주도 섹터 대장주 선별
-    df_themed = df_res[df_res['sector'].isin(["반도체/소부장", "전력인프라/광통신", "방산/원자력/우주", "2차전지/소재"])]
+    df_themed = df_res[df_res['sector'].isin(["반도체/AI/소부장", "전력망/광통신/에너지", "방산/원자력/우주", "2차전지/배터리"])]
     top_sector_leader = None
     if not df_themed.empty:
         top_sector_leader = df_themed.sort_values(by=['score', 'm_rs'], ascending=[False, False]).iloc[0]
