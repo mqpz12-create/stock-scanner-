@@ -35,9 +35,8 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 전 종목 로컬 지능형 자동 매칭 스캔 시작...")
+log(f"[*] {today_str} 당일/5일 정밀 수급 분리 매칭 스캔 시작...")
 
-# 1. KOSPI 지수
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
     kospi_close = df_kospi['Close']
@@ -52,11 +51,8 @@ target_tickers = list(df_krx.sort_values(by='Marcap', ascending=False)['Code'].h
 must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340"]
 target_tickers = list(set(target_tickers + must_have))
 
-# 100% 로컬 판정: 한국 증시 전 종목 자동 매칭 엔진 (네트워크 차단 영향 없음)
 def auto_classify_sector(code, name):
     nm = name.replace(" ", "")
-    
-    # 1. 반도체 / AI / 소부장 (삼성전자, 하이닉스, 스퀘어, HPSP, 피에스케이, 제주반도체, 티씨케이 등)
     if any(k in nm for k in [
         "삼성전자", "하이닉스", "스퀘어", "반도체", "칩스", "웨이퍼", "소부장", "테크", "하이텍", 
         "hpsp", "피에스케이", "케이씨텍", "티씨케이", "티엘비", "이오테크닉스", "머트리얼즈", "머티리얼즈",
@@ -65,41 +61,35 @@ def auto_classify_sector(code, name):
     ]):
         return "반도체/AI/소부장"
 
-    # 2. 전력망 / 광통신 / 신재생 (대한광통신, SGC에너지, SK이터닉스, 전선, LS 등)
     if any(k in nm for k in [
         "광통신", "전선", "전력", "에너지", "이터닉스", "케이블", "그린", "태양광", "풍력",
         "가온전선", "대한전선", "ls", "한국전력", "한전", "일진전기", "효성중공업", "제룡전기", "세명전기"
     ]):
         return "전력망/광통신/에너지"
 
-    # 3. 방산 / 원자력 / 우주항공 / 플랜트
     if any(k in nm for k in [
         "에어로", "항공", "방산", "우주", "에너빌리티", "넥스원", "카이", "로템", "한화시스템",
         "원자력", "플랜트", "엔지니어링", "삼성e&a", "두산", "한국항공우주"
     ]):
         return "방산/원자력/우주"
 
-    # 4. 바이오 / 제약 / 헬스케어
     if any(k in nm for k in [
         "바이오", "제약", "파마", "메디", "약품", "로직스", "셀트리온", "알테오젠", "유한양행",
         "에스티팜", "리가켐", "삼천당", "한미약품", "대웅제약", "케어", "헬스케어"
     ]):
         return "바이오/헬스케어"
 
-    # 5. 2차전지 / 배터리 / 핵심소재
     if any(k in nm for k in [
         "배터리", "이차전지", "리튬", "에코프로", "포스코퓨처엠", "엘앤에프", "엔솔", "sdi",
         "화학", "후성", "나노신소재", "대주전자재료", "코스모", "천보", "더블유씨피"
     ]):
         return "2차전지/배터리"
 
-    # 6. 금융 / 보험 / 지주사
     if any(k in nm for k in [
         "금융", "지주", "홀딩스", "생명", "화재", "보험", "증권", "은행", "카드", "캐피탈"
     ]):
         return "금융/보험/지주"
 
-    # 7. 자동차 / 부품 / 로봇
     if any(k in nm for k in [
         "현대차", "기아", "모비스", "글로비스", "오토", "타이어", "로봇", "로보틱스", "만도"
     ]):
@@ -111,7 +101,7 @@ def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
 
-# 매매동향 API (헤더 보강으로 차단 방지)
+# 당일 수급과 5일 누적을 명확히 분리하는 정밀 수급 분석기
 def get_investor_trend(code):
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=5&page=1"
@@ -128,22 +118,39 @@ def get_investor_trend(code):
         if not trends:
             return "⚪️ 수급 공방 (중립)", 3
 
-        inst_sum = 0
-        frgn_sum = 0
-        for item in trends[:5]:
-            inst_sum += int(str(item.get('institutionPureBuyQuant', '0')).replace(',', ''))
-            frgn_sum += int(str(item.get('foreignerPureBuyQuant', '0')).replace(',', ''))
+        # 당일 순매수
+        today_inst = int(str(trends[0].get('institutionPureBuyQuant', '0')).replace(',', ''))
+        today_frgn = int(str(trends[0].get('foreignerPureBuyQuant', '0')).replace(',', ''))
 
-        if inst_sum > 0 and frgn_sum > 0:
-            return f"🔥 외인·기관 쌍끌이 (+{inst_sum+frgn_sum:,}주)", 6
-        elif inst_sum > 0 and frgn_sum <= 0:
-            return f"⭐️ 기관 집중 매집 (+{inst_sum:,}주)", 5
-        elif frgn_sum > 0 and inst_sum <= 0:
-            return f"💎 외국인 집중 매집 (+{frgn_sum:,}주)", 5
-        elif inst_sum < 0 and frgn_sum < 0:
-            return "⚠️ 개인 홀로 매수 (외인·기관 동반 매도)", 0
+        # 5거래일 누적 순매수
+        inst_5d = sum(int(str(item.get('institutionPureBuyQuant', '0')).replace(',', '')) for item in trends[:5])
+        frgn_5d = sum(int(str(item.get('foreignerPureBuyQuant', '0')).replace(',', '')) for item in trends[:5])
+
+        # 1. 당일 외인·기관 쌍끌이
+        if today_inst > 0 and today_frgn > 0:
+            tag = f"🔥 당일 쌍끌이매수 (외인+{today_frgn:,} / 기관+{today_inst:,}) | 5일누적({frgn_5d+inst_5d:,})"
+            score = 6
+        # 2. 당일 외인 매도 전환 (5일 누적은 매수 우위 잔류)
+        elif today_frgn < 0 and frgn_5d > 0:
+            tag = f"⚠️ 외인 당일매도({today_frgn:,}) | 5일누적(+{frgn_5d:,})"
+            score = 2
+        # 3. 당일 외인 순매집
+        elif today_frgn > 0 and today_inst <= 0:
+            tag = f"💎 외인 당일매집(+{today_frgn:,}) | 5일누적({frgn_5d:,})"
+            score = 5
+        # 4. 당일 기관 순매집
+        elif today_inst > 0 and today_frgn <= 0:
+            tag = f"⭐️ 기관 당일매집(+{today_inst:,}) | 5일누적({inst_5d:,})"
+            score = 5
+        # 5. 메이저 동반 매도 (개인 홀로 매수)
+        elif today_inst < 0 and today_frgn < 0:
+            tag = f"⛔️ 외인·기관 동반매도 (외인{today_frgn:,} / 기관{today_inst:,})"
+            score = 0
         else:
-            return "⚪️ 수급 공방 (중립)", 3
+            tag = f"⚪️ 수급 공방 (외인{today_frgn:,} / 기관{today_inst:,})"
+            score = 3
+
+        return tag, score
     except Exception:
         return "⚪️ 수급 공방 (중립)", 3
 
@@ -222,14 +229,13 @@ def analyze_stock(code):
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 6. 수급 분석
+        # 6. 정밀 수급 분석
         investor_tag, investor_score = get_investor_trend(code)
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
         name = name.replace("[", "").replace("]", "").replace("*", "")
         
-        # 로컬 자동 매칭 엔진 실행 (통신 에러 원천 차단)
         sector = auto_classify_sector(code, name)
 
         if 99.0 <= disp <= 103.0:
@@ -358,7 +364,7 @@ if results:
         msg += f"   - 모바일차트: {chart_url_i}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    # 전체 리스트 브리핑 (섹터 내 점수 높은 순 정렬)
+    # 전체 리스트 브리핑
     df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False])
     for sec, grp in df_sorted.groupby("sector", sort=False):
         msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
@@ -376,4 +382,4 @@ else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 전 종목 자동 매칭 스캔 완료")
+log("[*] 당일/5일 분리 수급 발송 완료")
