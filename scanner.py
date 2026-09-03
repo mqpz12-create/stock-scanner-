@@ -1,30 +1,42 @@
 import os
+import sys
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import FinanceDataReader as fdr
+
+# 실시간 출력을 위해 버퍼 강제 비우기
+def log(text):
+    print(text, flush=True)
 
 def send_telegram(message):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        print("[!] 텔레그램 환경변수 누락")
+        log("[!] 텔레그램 환경변수 누락")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
-    requests.post(url, json=payload)
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        log(f"[!] 텔레그램 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 
-print(f"[*] {today_str} 기준 한국 시장 전수 스크리닝 시작 (엔진: FinanceDataReader)...")
+log(f"[*] {today_str} 기준 초고속 스크리닝 시작...")
 
+# 1. KRX 전 종목 리스트 수집
 df_krx = fdr.StockListing('KRX')
-print(f"[*] 총 {len(df_krx)}개 상장 종목 확보 완료.")
-
 if 'Marcap' in df_krx.columns:
     df_krx = df_krx[df_krx['Marcap'] >= 500_0000_0000]
+
+target_tickers = list(df_krx.sort_values(by='Marcap', ascending=False)['Code'].head(400))
+must_have = ["005090", "065060", "094480", "327260", "010140", "028050"]
+target_tickers = list(set(target_tickers + must_have))
 
 SECTORS = {
     "005090": "에너지/전력망", "065060": "에너지/전력망", "094480": "에너지/전력망",
@@ -35,46 +47,43 @@ SECTORS = {
     "012330": "자동차", "005380": "자동차", "003030": "철강/소재"
 }
 
-results = []
-
-target_tickers = list(df_krx.sort_values(by='Marcap', ascending=False)['Code'].head(500))
-must_have = ["005090", "065060", "094480", "327260", "010140", "028050"]
-target_tickers = list(set(target_tickers + must_have))
-
-print(f"[*] 핵심 500개 종목 30주선(150일선) & 거래량 풀백 정밀 계산 중...")
-
-for code in target_tickers:
+# 개별 종목 분석 함수
+def analyze_stock(code):
     try:
         df = fdr.DataReader(code, start_str)
         if len(df) < 140:
-            continue
+            return None
 
         close_price = int(df['Close'].iloc[-1])
         if close_price < 1000:
-            continue
+            return None
 
+        # 30주선 (150일 단순이평)
         df['SMA150'] = df['Close'].rolling(150, min_periods=100).mean()
         sma150 = df['SMA150'].iloc[-1]
         prev_sma150 = df['SMA150'].iloc[-20]
 
+        # 조건 1: 30주선 우상향/보합
         if np.isnan(sma150) or np.isnan(prev_sma150) or sma150 < (prev_sma150 * 0.99):
-            continue
+            return None
 
+        # 조건 2: 30주선 풀백 (-4% ~ +9%)
         disp = (close_price / sma150) * 100.0
         if not (96.0 <= disp <= 109.0):
-            continue
+            return None
 
+        # 조건 3: 거래량 수렴 (20일 평균 대비 95% 이하)
         v_avg = df['Volume'].iloc[-21:-1].mean()
         t_vol = df['Volume'].iloc[-1]
         vol_ratio = (t_vol / v_avg) if v_avg > 0 else 1.0
         if vol_ratio > 0.95:
-            continue
+            return None
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
         sector = SECTORS.get(code, "일반/제조")
 
-        results.append({
+        return {
             "code": code,
             "name": name,
             "sector": sector,
@@ -82,11 +91,28 @@ for code in target_tickers:
             "sma150": int(sma150),
             "disp": round(disp, 1),
             "vol_ratio": round(vol_ratio, 2)
-        })
-
+        }
     except Exception:
-        continue
+        return None
 
+results = []
+log(f"[*] 총 {len(target_tickers)}개 종목 초고속 병렬 스캔 시작...")
+
+# 15개 스레드로 동시 병렬 처리 (1분 이내 완료)
+with ThreadPoolExecutor(max_workers=15) as executor:
+    future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
+    completed = 0
+    for future in as_completed(future_to_code):
+        completed += 1
+        if completed % 50 == 0 or completed == len(target_tickers):
+            log(f" -> 진행률: {completed}/{len(target_tickers)} 완료")
+        res = future.result()
+        if res:
+            results.append(res)
+
+log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
+
+# 텔레그램 메시지 구성
 msg = f"📊 *[{today_str} 스탠 와인스타인 30주선 A포인트 리포트]*\n"
 msg += f"- 포착 종목수: *{len(results)}개*\n"
 msg += "--------------------------------------\n"
@@ -100,6 +126,7 @@ if results:
             msg += f"   - 30주선: `{r['sma150']:,}원` (이격: `{r['disp']}%`)\n"
             msg += f"   - 거래량 마름: 평소의 `{int(r['vol_ratio']*100)}%`\n"
 else:
-    msg += "오늘 30주선 풀백 및 거래량 절벽 조건을 만족하는 종목이 없습니다."
+    msg += "오늘 30주선 풀백 조건을 만족하는 종목이 없습니다."
 
 send_telegram(msg)
+log("[*] 텔레그램 전송 완료!")
