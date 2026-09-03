@@ -1,0 +1,31 @@
+name: Weinstein 30W Daily Scanner
+
+on:
+  schedule:
+    # 한국시간(KST) 평일(월~금) 오후 3시 40분 실행 (UTC 06:40)
+    - cron: '40 6 * * 1-5'
+  workflow_dispatch: # 깃허브 웹에서 'Run workflow' 버튼으로 수동 즉시 실행 지원
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v3
+
+      - name: 파이썬 3.10 설치
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 필수 라이브러리 설치
+        run: |
+          pip install --upgrade pip
+          pip install pykrx pandas numpy requests
+
+      - name: 스캐너 실행 및 텔레그램 발송
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scanner.py
