@@ -9,7 +9,6 @@ import FinanceDataReader as fdr
 def log(text):
     print(text, flush=True)
 
-# 텔레그램 안전 전송 (파싱 에러가 없는 일반 텍스트 모드)
 def send_telegram(message):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
@@ -22,7 +21,6 @@ def send_telegram(message):
     msg_chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
     
     for chunk in msg_chunks:
-        # parse_mode를 빼서 괄호/퍼센트 충돌을 원천 차단
         payload = {
             "chat_id": chat_id, 
             "text": chunk, 
@@ -37,9 +35,8 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=450)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 스탠 와인스타인 실전 입체 스캔 시작...")
+log(f"[*] {today_str} 거래량 MTS 정밀 동기화 스캔 시작...")
 
-# 코스피 벤치마크 (상대강도 RS용)
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
     kospi_ret = (df_kospi['Close'].iloc[-1] / df_kospi['Close'].iloc[-20]) - 1.0
@@ -63,8 +60,8 @@ SECTORS = {
     "012330": "자동차", "005380": "자동차", "003030": "철강/소재"
 }
 
-def make_vol_bar(ratio):
-    filled = int(round(min(ratio, 1.0) * 10))
+def make_vol_bar(ratio_pct):
+    filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
 
 def analyze_stock(code):
@@ -73,7 +70,7 @@ def analyze_stock(code):
         if len(df_d) < 150:
             return None
 
-        # 키움 MTS 일치 주봉 생성
+        # 1. 키움 MTS 일치형 주봉 30주선 계산
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -86,36 +83,44 @@ def analyze_stock(code):
         sma30 = df_w['SMA30'].iloc[-1]
         prev_sma30 = df_w['SMA30'].iloc[-5]
 
-        # 1. 30주선 우상향/보합 확인
+        # 30주선 우상향/보합 확인
         if np.isnan(sma30) or np.isnan(prev_sma30) or sma30 < (prev_sma30 * 0.995):
             return None
 
-        # 2. 30주선 풀백 구간 (-3% ~ +8%)
+        # 30주선 풀백 구간 (-3% ~ +8%)
         disp = (current_price / sma30) * 100.0
         if not (97.0 <= disp <= 108.0):
             return None
 
-        # 3. 거래량 절벽 검증 (20일 평균 대비 90% 이하)
-        v_avg = df_d['Volume'].iloc[-21:-1].mean()
-        t_vol = df_d['Volume'].iloc[-1]
-        vol_ratio = (t_vol / v_avg) if v_avg > 0 else 1.0
-        if vol_ratio > 0.90:
+        # 2. 거래량 정밀 계산 (MTS 전일비 & 20일 이평비)
+        today_vol = float(df_d['Volume'].iloc[-1])
+        prev_vol = float(df_d['Volume'].iloc[-2])
+        
+        # 키움 MTS 십자선 전일 대비 거래량 비율 (%)
+        vol_ratio_prev = (today_vol / prev_vol * 100.0) if prev_vol > 0 else 100.0
+        
+        # HTS 20일 거래량 이동평균 대비 비율 (%)
+        vol_sma20 = df_d['Volume'].rolling(20).mean().iloc[-1]
+        vol_ratio_sma20 = (today_vol / vol_sma20 * 100.0) if vol_sma20 > 0 else 100.0
+
+        # 와인스타인 필터: 20일 평균 거래량 대비 90% 이하로 마른 종목 선별
+        if vol_ratio_sma20 > 90.0:
             return None
 
-        # 4. 차트 패턴 분석
+        # 3. 패턴 판정
         recent_5 = df_d.iloc[-5:]
         range_5 = (recent_5['High'].max() - recent_5['Low'].min()) / current_price * 100.0
         recent_20 = df_d.iloc[-20:]
         range_20 = (recent_20['High'].max() - recent_20['Low'].min()) / current_price * 100.0
         
-        if range_5 <= 6.0 and vol_ratio <= 0.60:
+        if range_5 <= 6.0 and vol_ratio_sma20 <= 65.0:
             pattern_tag = "상승깃발형 (변동폭 축소+거래량 절벽)"
         elif range_5 < (range_20 * 0.45):
             pattern_tag = "삼각수렴 지지 (에너지 응축)"
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 5. 상대강도 RS
+        # 4. 상대강도 RS
         stock_ret_20 = (current_price / df_d['Close'].iloc[-20]) - 1.0
         rs_diff = (stock_ret_20 - kospi_ret) * 100.0
         if rs_diff >= 5.0:
@@ -127,6 +132,7 @@ def analyze_stock(code):
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
+        name = name.replace("[", "").replace("]", "").replace("*", "")
         sector = SECTORS.get(code, "일반/기타")
 
         if 99.0 <= disp <= 103.0:
@@ -143,7 +149,9 @@ def analyze_stock(code):
             "price": current_price,
             "sma30": int(round(sma30)),
             "disp": round(disp, 1),
-            "vol_ratio": round(vol_ratio, 2),
+            "vol_today": int(today_vol),
+            "vol_ratio_prev": round(vol_ratio_prev, 1),
+            "vol_ratio_sma20": round(vol_ratio_sma20, 1),
             "tag": tag,
             "pattern": pattern_tag,
             "rs": rs_tag
@@ -163,27 +171,27 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-# 일반 텍스트 포맷 (특수문자 에러 원천 방지)
+# 출력 조립 (MTS 전일비 + 20일 이평비 명확 표기)
 msg = f"📊 [{today_str} 스탠 와인스타인 30주선 실전 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n"
 msg += "────────────────────\n"
 
 if results:
-    df_res = pd.DataFrame(results).sort_values(by=["sector", "vol_ratio"])
+    df_res = pd.DataFrame(results).sort_values(by=["sector", "vol_ratio_sma20"])
     for sec, grp in df_res.groupby("sector"):
         msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
         for _, r in grp.iterrows():
-            bar = make_vol_bar(r['vol_ratio'])
-            pct = int(r['vol_ratio'] * 100)
+            bar = make_vol_bar(r['vol_ratio_sma20'])
             
             msg += f"▶ {r['name']} ({r['price']:,}원) [{r['tag']}]\n"
             msg += f"   - 패턴: {r['pattern']}\n"
             msg += f"   - 상대강도: {r['rs']}\n"
             msg += f"   - 30주선: {r['sma30']:,}원 (이격도: {r['disp']}%)\n"
-            msg += f"   - 거래량: 평소의 {pct}% [{bar}]\n"
+            msg += f"   - 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n"
+            msg += f"   - 20일이평비: {r['vol_ratio_sma20']}% [{bar}]\n"
             msg += f"   - 차트보기: https://m.stock.naver.com/item/{r['code']}\n"
 else:
-    msg += "오늘 주봉 30주선 지지 조건을 충족하는 종목이 없습니다."
+    msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 텔레그램 전송 루틴 종료")
+log("[*] 텔레그램 발송 완료")
