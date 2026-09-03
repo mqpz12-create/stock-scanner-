@@ -33,16 +33,17 @@ def send_telegram(message):
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-start_str = (datetime.today() - timedelta(days=450)).strftime("%Y-%m-%d")
+# 정통 52주(1년) Mansfield RS 계산을 위해 500일 전부터 수집
+start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} Mansfield RS 최우선 스탠 와인스타인 스캔 시작...")
+log(f"[*] {today_str} 정통 52주 Mansfield RS 스캔 시작...")
 
-# 코스피 벤치마크 (20거래일 수익률 산출)
+# 1. 벤치마크 KOSPI 지수 확보
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
-    kospi_ret = (df_kospi['Close'].iloc[-1] / df_kospi['Close'].iloc[-20]) - 1.0
+    kospi_close = df_kospi['Close']
 except Exception:
-    kospi_ret = 0.0
+    kospi_close = None
 
 df_krx = fdr.StockListing('KRX')
 if 'Marcap' in df_krx.columns:
@@ -68,10 +69,10 @@ def make_vol_bar(ratio_pct):
 def analyze_stock(code):
     try:
         df_d = fdr.DataReader(code, start_str)
-        if len(df_d) < 150:
+        if len(df_d) < 180 or kospi_close is None:
             return None
 
-        # 키움 MTS 일치형 주봉 30주선 (금요일 기준 리샘플링)
+        # 키움 MTS 일치형 주봉 30주선 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -84,7 +85,7 @@ def analyze_stock(code):
         sma30 = df_w['SMA30'].iloc[-1]
         prev_sma30 = df_w['SMA30'].iloc[-5]
 
-        # 1. 30주선 우상향/수평 지지
+        # 1. 30주선 우상향/보합 확인
         if np.isnan(sma30) or np.isnan(prev_sma30) or sma30 < (prev_sma30 * 0.995):
             return None
 
@@ -93,7 +94,7 @@ def analyze_stock(code):
         if not (97.0 <= disp <= 108.0):
             return None
 
-        # 3. 거래량 정밀 계산
+        # 3. 거래량 절벽 정밀 계산
         today_vol = float(df_d['Volume'].iloc[-1])
         prev_vol = float(df_d['Volume'].iloc[-2])
         vol_ratio_prev = (today_vol / prev_vol * 100.0) if prev_vol > 0 else 100.0
@@ -103,7 +104,29 @@ def analyze_stock(code):
         if vol_ratio_sma20 > 90.0:
             return None
 
-        # 4. 차트 패턴 분석
+        # 4. 정통 Mansfield Relative Strength (52주 기준 정규화)
+        # 종목과 코스피 날짜 동기화
+        df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
+        if len(df_rs) >= 120:
+            rs_line = df_rs['stock'] / df_rs['kospi']
+            # 와인스타인 정통 52주(가용 데이터 기반 rolling) RS 이평선
+            window = min(len(df_rs), 250)
+            rs_sma = rs_line.rolling(window, min_periods=60).mean()
+            # Mansfield RS 공식: ((RS Line / RS SMA) - 1) * 100
+            m_rs = ((rs_line.iloc[-1] / rs_sma.iloc[-1]) - 1.0) * 100.0
+        else:
+            m_rs = 0.0
+
+        if m_rs >= 15.0:
+            rs_tag = f"🔥 시장 압도적 초강세 (Mansfield +{m_rs:.1f})"
+        elif m_rs >= 5.0:
+            rs_tag = f"🚀 지수 대비 강세 (Mansfield +{m_rs:.1f})"
+        elif m_rs >= 0.0:
+            rs_tag = f"🟢 지수 대비 우위 (Mansfield +{m_rs:.1f})"
+        else:
+            rs_tag = f"⚪️ 시장 하회 흐름 (Mansfield {m_rs:.1f})"
+
+        # 5. 차트 수렴 패턴
         recent_5 = df_d.iloc[-5:]
         range_5 = (recent_5['High'].max() - recent_5['Low'].min()) / current_price * 100.0
         recent_20 = df_d.iloc[-20:]
@@ -118,33 +141,19 @@ def analyze_stock(code):
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 5. 핵심: Mansfield RS (시장 대비 상대강도)
-        stock_ret_20 = (current_price / df_d['Close'].iloc[-20]) - 1.0
-        rs_diff = (stock_ret_20 - kospi_ret) * 100.0
-        if rs_diff >= 10.0:
-            rs_tag = f"🔥 시장 압도적 초강세 (+{rs_diff:.1f}%)"
-        elif rs_diff >= 3.0:
-            rs_tag = f"🚀 지수 대비 강세 (+{rs_diff:.1f}%)"
-        elif rs_diff >= 0.0:
-            rs_tag = f"🟢 지수 대비 견조 (+{rs_diff:.1f}%)"
-        else:
-            rs_tag = f"⚪️ 지수 연동 흐름 ({rs_diff:.1f}%)"
-
-        # 와인스타인 종합 점수 (RS 가중치 대폭 상향: 40점 배정)
+        # 와인스타인 실전 종합 스코어 (100점 만점)
         score = 0
-        # 1) Mansfield RS (40점)
-        if rs_diff >= 15.0:
+        # Mansfield RS 점수 (40점)
+        if m_rs >= 15.0:
             score += 40
-        elif rs_diff >= 7.0:
-            score += 35
-        elif rs_diff >= 2.0:
-            score += 25
-        elif rs_diff >= 0.0:
-            score += 15
+        elif m_rs >= 7.0:
+            score += 34
+        elif m_rs >= 0.0:
+            score += 26
         else:
-            score += 5
+            score += 10
 
-        # 2) 30주선 지지 완성도 (30점)
+        # 30주선 지지 완성도 (30점)
         if 99.5 <= disp <= 102.5:
             score += 30
         elif 98.0 <= disp <= 104.5:
@@ -152,7 +161,7 @@ def analyze_stock(code):
         else:
             score += 12
 
-        # 3) 거래량 마름 완성도 (20점)
+        # 거래량 마름 완성도 (20점)
         if vol_ratio_sma20 <= 45.0:
             score += 20
         elif vol_ratio_sma20 <= 65.0:
@@ -160,7 +169,7 @@ def analyze_stock(code):
         else:
             score += 8
 
-        # 4) 차트 수렴 패턴 (10점)
+        # 차트 수렴 패턴 (10점)
         if is_flag:
             score += 10
         elif "삼각수렴" in pattern_tag:
@@ -193,7 +202,7 @@ def analyze_stock(code):
             "tag": tag,
             "pattern": pattern_tag,
             "rs": rs_tag,
-            "rs_diff": rs_diff,
+            "m_rs": m_rs,
             "score": score
         }
     except Exception:
@@ -217,19 +226,18 @@ msg += f"• 조건 충족 종목수: 총 {len(results)}개\n"
 if results:
     df_res = pd.DataFrame(results)
 
-    # 1. 주도 섹터 대장주 (핵심 섹터 중 RS와 종합 점수 최상위)
+    # 1. 주도 섹터 대장주 (포착 종목이 많은 섹터의 최고점주)
     df_themed = df_res[df_res['sector'] != "일반/기타"]
     top_sector_leader = None
     if not df_themed.empty:
         leading_sec = df_themed['sector'].value_counts().index[0]
-        top_sector_leader = df_themed[df_themed['sector'] == leading_sec].sort_values(by=['score', 'rs_diff'], ascending=[False, False]).iloc[0]
+        top_sector_leader = df_themed[df_themed['sector'] == leading_sec].sort_values(by=['score', 'm_rs'], ascending=[False, False]).iloc[0]
 
-    # 2. 독자 돌파 개별 초강세주: Mansfield RS 1위 (시장을 가장 강하게 이기는 독자 Alpha)
+    # 2. 독자 돌파 개별 초강세주: 52주 Mansfield RS 1위 (장기 시장 대비 최강 종목)
     df_indie = df_res[df_res['code'] != (top_sector_leader['code'] if top_sector_leader is not None else "")]
     indie_alpha = None
     if not df_indie.empty:
-        # 시장 대비 초과 성과(rs_diff)가 가장 압도적인 종목 선별
-        indie_alpha = df_indie.sort_values(by=['rs_diff', 'score'], ascending=[False, False]).iloc[0]
+        indie_alpha = df_indie.sort_values(by=['m_rs', 'score'], ascending=[False, False]).iloc[0]
 
     msg += "\n🔥 [TODAY'S HIGHLIGHT : 최우선 관심주]\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -250,12 +258,12 @@ if results:
         msg += f"   - 상대강도: {indie_alpha['rs']}\n"
         msg += f"   - 패턴: {indie_alpha['pattern']}\n"
         msg += f"   - 30주선: {indie_alpha['sma30']:,}원 (이격: {indie_alpha['disp']}%)\n"
-        msg += f"   - 거래량: 20일이평비 {indie_alpha['vol_ratio_sma20']}% [{bar_i}] (전일비: {indie_alpha['vol_ratio_prev']}%)\n"
+        msg += f"   - 거래량: 20일이평비 {indie_alpha['vol_ratio_sma20']}% [{bar_i}]\n"
         msg += f"   - 차트: https://m.stock.naver.com/item/{indie_alpha['code']}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    # 전체 리스트 브리핑 (모든 종목에 상대강도 RS 필수 출력)
-    df_sorted = df_res.sort_values(by=["sector", "rs_diff"], ascending=[True, False])
+    # 전체 리스트 브리핑 (Mansfield RS 기준 정렬)
+    df_sorted = df_res.sort_values(by=["sector", "m_rs"], ascending=[True, False])
     for sec, grp in df_sorted.groupby("sector"):
         msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
         for _, r in grp.iterrows():
