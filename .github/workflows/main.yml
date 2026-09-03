@@ -1,0 +1,30 @@
+name: Weinstein 30W Daily Scanner
+
+on:
+  schedule:
+    - cron: '40 6 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v3
+
+      - name: 파이썬 3.10 설치
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: 필수 패키지 설치
+        run: |
+          pip install --upgrade pip
+          pip install pykrx pandas numpy requests
+
+      - name: 스캐너 실행
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python scanner.py
