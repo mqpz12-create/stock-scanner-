@@ -9,11 +9,12 @@ import FinanceDataReader as fdr
 def log(text):
     print(text, flush=True)
 
+# 텔레그램 안전 전송 (파싱 에러가 없는 일반 텍스트 모드)
 def send_telegram(message):
     token = os.environ.get("TELEGRAM_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        log("[!] 텔레그램 환경변수 누락")
+        log("[!] 텔레그램 토큰 또는 Chat ID 누락")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     
@@ -21,23 +22,24 @@ def send_telegram(message):
     msg_chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
     
     for chunk in msg_chunks:
+        # parse_mode를 빼서 괄호/퍼센트 충돌을 원천 차단
         payload = {
             "chat_id": chat_id, 
             "text": chunk, 
-            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
         try:
-            requests.post(url, json=payload, timeout=10)
+            res = requests.post(url, json=payload, timeout=10)
+            log(f"[*] 텔레그램 응답 코드: {res.status_code}")
         except Exception as e:
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=450)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 와인스타인 패턴 & 수급 정밀 스캔 시작...")
+log(f"[*] {today_str} 스탠 와인스타인 실전 입체 스캔 시작...")
 
-# 1. 벤치마크 지수(KOSPI) 수집 (Mansfield RS 상대강도 계산용)
+# 코스피 벤치마크 (상대강도 RS용)
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
     kospi_ret = (df_kospi['Close'].iloc[-1] / df_kospi['Close'].iloc[-20]) - 1.0
@@ -63,7 +65,7 @@ SECTORS = {
 
 def make_vol_bar(ratio):
     filled = int(round(min(ratio, 1.0) * 10))
-    return "█" * filled + "░" * (10 - filled)
+    return "■" * filled + "□" * (10 - filled)
 
 def analyze_stock(code):
     try:
@@ -71,7 +73,7 @@ def analyze_stock(code):
         if len(df_d) < 150:
             return None
 
-        # 키움 일치형 주봉 생성
+        # 키움 MTS 일치 주봉 생성
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -84,7 +86,7 @@ def analyze_stock(code):
         sma30 = df_w['SMA30'].iloc[-1]
         prev_sma30 = df_w['SMA30'].iloc[-5]
 
-        # 1. 30주선 우상향 확인
+        # 1. 30주선 우상향/보합 확인
         if np.isnan(sma30) or np.isnan(prev_sma30) or sma30 < (prev_sma30 * 0.995):
             return None
 
@@ -100,40 +102,39 @@ def analyze_stock(code):
         if vol_ratio > 0.90:
             return None
 
-        # --- [패턴 분석: 상승 깃발형 & 변동성 수렴 판별] ---
+        # 4. 차트 패턴 분석
         recent_5 = df_d.iloc[-5:]
         range_5 = (recent_5['High'].max() - recent_5['Low'].min()) / current_price * 100.0
         recent_20 = df_d.iloc[-20:]
         range_20 = (recent_20['High'].max() - recent_20['Low'].min()) / current_price * 100.0
         
-        if range_5 <= 6.0 and vol_ratio <= 0.65:
-            pattern_tag = "🚩 상승깃발형 (변동폭 극소 & 거래량 절벽)"
+        if range_5 <= 6.0 and vol_ratio <= 0.60:
+            pattern_tag = "상승깃발형 (변동폭 축소+거래량 절벽)"
         elif range_5 < (range_20 * 0.45):
-            pattern_tag = "📐 삼각수렴 안착 (에너지 압축 중)"
+            pattern_tag = "삼각수렴 지지 (에너지 응축)"
         else:
-            pattern_tag = "🔹 30주선 안정적 지지"
+            pattern_tag = "30주선 안정 지지"
 
-        # --- [상대강도(RS): 코스피 대비 초과 성과] ---
+        # 5. 상대강도 RS
         stock_ret_20 = (current_price / df_d['Close'].iloc[-20]) - 1.0
         rs_diff = (stock_ret_20 - kospi_ret) * 100.0
         if rs_diff >= 5.0:
-            rs_tag = f"🚀 지수 대비 초강세 (+{rs_diff:.1f}%)"
+            rs_tag = f"지수 대비 초강세 (+{rs_diff:.1f}%)"
         elif rs_diff >= 0.0:
-            rs_tag = f"🟢 시장 대비 견조 (+{rs_diff:.1f}%)"
+            rs_tag = f"지수 대비 견조 (+{rs_diff:.1f}%)"
         else:
-            rs_tag = f"⚪️ 시장 연동 흐름 ({rs_diff:.1f}%)"
+            rs_tag = f"지수 연동 흐름 ({rs_diff:.1f}%)"
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
         sector = SECTORS.get(code, "일반/기타")
 
-        # 진입 태그 판정
         if 99.0 <= disp <= 103.0:
-            tag = "🎯 30주선 초밀착"
+            tag = "30주선 초밀착"
         elif disp < 99.0:
-            tag = "⚡️ 일시 언더슈팅"
+            tag = "일시 언더슈팅"
         else:
-            tag = "📈 30주선 위 지지"
+            tag = "30주선 위 지지"
 
         return {
             "code": code,
@@ -162,27 +163,27 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-# 고급 텔레그램 메시지 구성
-msg = f"📊 <b>[{today_str} 와인스타인 30주선 실전 입체 리포트]</b>\n"
-msg += f"• 조건 충족 종목: <b>{len(results)}개</b>\n"
+# 일반 텍스트 포맷 (특수문자 에러 원천 방지)
+msg = f"📊 [{today_str} 스탠 와인스타인 30주선 실전 리포트]\n"
+msg += f"• 조건 충족 종목수: 총 {len(results)}개\n"
 msg += "────────────────────\n"
 
 if results:
     df_res = pd.DataFrame(results).sort_values(by=["sector", "vol_ratio"])
     for sec, grp in df_res.groupby("sector"):
-        msg += f"\n📂 <b>[{sec}]</b> ({len(grp)}개)\n"
+        msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
         for _, r in grp.iterrows():
             bar = make_vol_bar(r['vol_ratio'])
             pct = int(r['vol_ratio'] * 100)
-            chart_url = f"https://m.stock.naver.com/item/{r['code']}"
             
-            msg += f"▫️ <b><a href='{chart_url}'>{r['name']}</a></b> (<b>{r['price']:,}원</b>) [{r['tag']}]\n"
-            msg += f"   • 패턴: {r['pattern']}\n"
-            msg += f"   • 상대강도: {r['rs']}\n"
-            msg += f"   • 30주선: <code>{r['sma30']:,}원</code> (이격도: <b>{r['disp']}%</b>)\n"
-            msg += f"   • 거래량: 평소의 <b>{pct}%</b> <code>[{bar}]</code>\n"
+            msg += f"▶ {r['name']} ({r['price']:,}원) [{r['tag']}]\n"
+            msg += f"   - 패턴: {r['pattern']}\n"
+            msg += f"   - 상대강도: {r['rs']}\n"
+            msg += f"   - 30주선: {r['sma30']:,}원 (이격도: {r['disp']}%)\n"
+            msg += f"   - 거래량: 평소의 {pct}% [{bar}]\n"
+            msg += f"   - 차트보기: https://m.stock.naver.com/item/{r['code']}\n"
 else:
     msg += "오늘 주봉 30주선 지지 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 전체 종목 발송 완료!")
+log("[*] 텔레그램 전송 루틴 종료")
