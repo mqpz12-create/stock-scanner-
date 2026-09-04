@@ -35,7 +35,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 당일/5일 정밀 수급 분리 매칭 스캔 시작...")
+log(f"[*] {today_str} 연속 등락 및 추세전환 판별 스캔 시작...")
 
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
@@ -101,10 +101,45 @@ def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
 
-# 당일 수급과 5일 누적을 명확히 분리하는 정밀 수급 분석기
-def get_investor_trend(code):
+# 연속 상승/하락 및 추세전환 계산 엔진
+def get_streak_info(df_d):
     try:
-        url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=5&page=1"
+        closes = df_d['Close'].values
+        if len(closes) < 5:
+            return ""
+        
+        diffs = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        last_diff = diffs[-1]
+        prev_diff = diffs[-2]
+        
+        # 1. 상승전환 (전일 하락 -> 당일 상승)
+        if last_diff > 0 and prev_diff <= 0:
+            return "⚡️첫 상승전환"
+        # 2. 하락전환 (전일 상승 -> 당일 하락)
+        elif last_diff < 0 and prev_diff >= 0:
+            return "💧첫 하락전환"
+        # 3. 연속 상승 카운트
+        elif last_diff > 0:
+            streak = 0
+            for d in reversed(diffs):
+                if d > 0: streak += 1
+                else: break
+            return f"🔥{streak}일연속상승"
+        # 4. 연속 하락 카운트
+        elif last_diff < 0:
+            streak = 0
+            for d in reversed(diffs):
+                if d < 0: streak += 1
+                else: break
+            return f"❄️{streak}일연속하락"
+        else:
+            return "➖보합"
+    except Exception:
+        return ""
+
+def get_investor_trend(code, latest_df_date):
+    try:
+        url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10&page=1"
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://m.stock.naver.com/'
@@ -118,36 +153,41 @@ def get_investor_trend(code):
         if not trends:
             return "⚪️ 수급 공방 (중립)", 3
 
-        # 당일 순매수
-        today_inst = int(str(trends[0].get('institutionPureBuyQuant', '0')).replace(',', ''))
-        today_frgn = int(str(trends[0].get('foreignerPureBuyQuant', '0')).replace(',', ''))
+        target_idx = 0
+        target_date_str = latest_df_date.strftime("%Y%m%d")
+        for idx, item in enumerate(trends):
+            b_date = str(item.get('bizdate', '')).replace("-", "")
+            if b_date == target_date_str:
+                target_idx = idx
+                break
 
-        # 5거래일 누적 순매수
-        inst_5d = sum(int(str(item.get('institutionPureBuyQuant', '0')).replace(',', '')) for item in trends[:5])
-        frgn_5d = sum(int(str(item.get('foreignerPureBuyQuant', '0')).replace(',', '')) for item in trends[:5])
+        item_today = trends[target_idx]
+        today_inst = int(str(item_today.get('institutionPureBuyQuant', '0')).replace(',', ''))
+        today_frgn = int(str(item_today.get('foreignerPureBuyQuant', '0')).replace(',', ''))
 
-        # 1. 당일 외인·기관 쌍끌이
+        slice_5d = trends[target_idx:target_idx+5]
+        inst_5d = sum(int(str(it.get('institutionPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
+        frgn_5d = sum(int(str(it.get('foreignerPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
+
+        date_prefix = "" if target_idx == 0 else f"[{trends[target_idx].get('bizdate','')}] "
+
         if today_inst > 0 and today_frgn > 0:
-            tag = f"🔥 당일 쌍끌이매수 (외인+{today_frgn:,} / 기관+{today_inst:,}) | 5일누적({frgn_5d+inst_5d:,})"
+            tag = f"{date_prefix}🔥 쌍끌이매수 (외인+{today_frgn:,} / 기관+{today_inst:,}) | 5일누적({frgn_5d+inst_5d:,})"
             score = 6
-        # 2. 당일 외인 매도 전환 (5일 누적은 매수 우위 잔류)
         elif today_frgn < 0 and frgn_5d > 0:
-            tag = f"⚠️ 외인 당일매도({today_frgn:,}) | 5일누적(+{frgn_5d:,})"
+            tag = f"{date_prefix}⚠️ 외인 당일매도({today_frgn:,}) | 5일누적(+{frgn_5d:,})"
             score = 2
-        # 3. 당일 외인 순매집
         elif today_frgn > 0 and today_inst <= 0:
-            tag = f"💎 외인 당일매집(+{today_frgn:,}) | 5일누적({frgn_5d:,})"
+            tag = f"{date_prefix}💎 외인 당일매집(+{today_frgn:,}) | 5일누적({frgn_5d:,})"
             score = 5
-        # 4. 당일 기관 순매집
         elif today_inst > 0 and today_frgn <= 0:
-            tag = f"⭐️ 기관 당일매집(+{today_inst:,}) | 5일누적({inst_5d:,})"
+            tag = f"{date_prefix}⭐️ 기관 당일매집(+{today_inst:,}) | 5일누적({inst_5d:,})"
             score = 5
-        # 5. 메이저 동반 매도 (개인 홀로 매수)
         elif today_inst < 0 and today_frgn < 0:
-            tag = f"⛔️ 외인·기관 동반매도 (외인{today_frgn:,} / 기관{today_inst:,})"
+            tag = f"{date_prefix}⛔️ 외인·기관 동반매도 (외인{today_frgn:,} / 기관{today_inst:,})"
             score = 0
         else:
-            tag = f"⚪️ 수급 공방 (외인{today_frgn:,} / 기관{today_inst:,})"
+            tag = f"{date_prefix}⚪️ 수급 공방 (외인{today_frgn:,} / 기관{today_inst:,})"
             score = 3
 
         return tag, score
@@ -160,7 +200,6 @@ def analyze_stock(code):
         if len(df_d) < 180 or kospi_close is None:
             return None
 
-        # 키움 일치 주봉 30주선 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -170,6 +209,20 @@ def analyze_stock(code):
 
         df_w['SMA30'] = df_w['Close'].rolling(30).mean()
         current_price = int(df_d['Close'].iloc[-1])
+        prev_close = int(df_d['Close'].iloc[-2])
+        latest_date = df_d.index[-1]
+
+        # 등락률 및 연속/전환 시그널 연산
+        chg_pct = ((current_price - prev_close) / prev_close) * 100.0
+        streak_tag = get_streak_info(df_d)
+        
+        if chg_pct > 0:
+            chg_str = f"🔺+{chg_pct:.2f}%" + (f" [{streak_tag}]" if streak_tag else "")
+        elif chg_pct < 0:
+            chg_str = f"🔻{chg_pct:.2f}%" + (f" [{streak_tag}]" if streak_tag else "")
+        else:
+            chg_str = f"➖ 0.00%" + (f" [{streak_tag}]" if streak_tag else "")
+
         sma30 = df_w['SMA30'].iloc[-1]
         prev_sma30 = df_w['SMA30'].iloc[-5]
 
@@ -229,8 +282,8 @@ def analyze_stock(code):
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 6. 정밀 수급 분석
-        investor_tag, investor_score = get_investor_trend(code)
+        # 6. 날짜 일치 수급 분석
+        investor_tag, investor_score = get_investor_trend(code, latest_date)
 
         name_match = df_krx[df_krx['Code'] == code]
         name = name_match['Name'].iloc[0] if not name_match.empty else code
@@ -250,6 +303,7 @@ def analyze_stock(code):
             "name": name,
             "sector": sector,
             "price": current_price,
+            "chg_str": chg_str,
             "sma30": int(round(sma30)),
             "disp": round(disp, 1),
             "vol_today": int(today_vol),
@@ -343,7 +397,7 @@ if results:
         bar_t = make_vol_bar(top_sector_leader['vol_ratio_sma20'])
         chart_url_t = f"https://m.stock.naver.com/domestic/stock/{top_sector_leader['code']}/total"
         msg += f"🏆 주도섹터 최우선 대장주 ({top_sector_leader['sec_badge']})\n"
-        msg += f"▶ {top_sector_leader['name']} ({top_sector_leader['price']:,}원) [{top_sector_leader['sector']} | 와인스타인 {top_sector_leader['score']}점]\n"
+        msg += f"▶ {top_sector_leader['name']} ({top_sector_leader['price']:,}원 | {top_sector_leader['chg_str']}) [{top_sector_leader['sector']} | 와인스타인 {top_sector_leader['score']}점]\n"
         msg += f"   - 수급주체: {top_sector_leader['investor']}\n"
         msg += f"   - 상대강도: {top_sector_leader['rs']}\n"
         msg += f"   - 패턴: {top_sector_leader['pattern']}\n"
@@ -355,7 +409,7 @@ if results:
         bar_i = make_vol_bar(indie_alpha['vol_ratio_sma20'])
         chart_url_i = f"https://m.stock.naver.com/domestic/stock/{indie_alpha['code']}/total"
         msg += f"⚡️ 독자 돌파 개별 초강세주 (Mansfield RS 1위)\n"
-        msg += f"▶ {indie_alpha['name']} ({indie_alpha['price']:,}원) [{indie_alpha['sector']} | 와인스타인 {indie_alpha['score']}점]\n"
+        msg += f"▶ {indie_alpha['name']} ({indie_alpha['price']:,}원 | {indie_alpha['chg_str']}) [{indie_alpha['sector']} | 와인스타인 {indie_alpha['score']}점]\n"
         msg += f"   - 수급주체: {indie_alpha['investor']}\n"
         msg += f"   - 상대강도: {indie_alpha['rs']}\n"
         msg += f"   - 패턴: {indie_alpha['pattern']}\n"
@@ -364,14 +418,14 @@ if results:
         msg += f"   - 모바일차트: {chart_url_i}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    # 전체 리스트 브리핑
+    # 전체 리스트 브리핑 (섹터 내 점수 높은 순 정렬)
     df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False])
     for sec, grp in df_sorted.groupby("sector", sort=False):
         msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
         for _, r in grp.iterrows():
             bar = make_vol_bar(r['vol_ratio_sma20'])
             chart_url = f"https://m.stock.naver.com/domestic/stock/{r['code']}/total"
-            msg += f"• {r['name']} ({r['price']:,}원) [{r['score']}점 | {r['tag']}]\n"
+            msg += f"• {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']}]\n"
             msg += f"   - 수급: {r['investor']}\n"
             msg += f"   - 상대강도: {r['rs']}\n"
             msg += f"   - 패턴: {r['pattern']}\n"
@@ -382,4 +436,4 @@ else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 당일/5일 분리 수급 발송 완료")
+log("[*] 연속 등락 및 추세전환 판별 발송 완료")
