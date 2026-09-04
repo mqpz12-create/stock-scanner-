@@ -35,7 +35,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 상승깃발형 & VCP 입체 스캔 시작...")
+log(f"[*] {today_str} 무탈락 입체 VCP & 30주선 스캐너 구동...")
 
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
@@ -150,7 +150,7 @@ def analyze_stock(code):
         if len(df_d) < 180 or kospi_close is None:
             return None
 
-        # 키움 조건 I: 거래량 20만 주 이상
+        # 키움 조건 I: 당일 거래량 20만 주 이상
         today_vol = float(df_d['Volume'].iloc[-1])
         if today_vol < 200_000:
             return None
@@ -193,8 +193,12 @@ def analyze_stock(code):
         vol_1 = float(df_d['Volume'].iloc[-2])
         vol_ratio_prev = (today_vol / vol_1 * 100.0) if vol_1 > 0 else 100.0
 
+        # 단기 이평선(20일선) 위치 판별 (탈락 대신 가산점 적용용)
+        ma20 = df_d['Close'].rolling(20).mean().iloc[-1]
+        is_above_ma20 = (current_price >= ma20)
+
         # ============================================================
-        # 상승깃발형(Bull Flag) & VCP 통합 패턴 엔진
+        # 상승깃발형 & VCP 통합 패턴 엔진 (무탈락 입체 판정)
         # ============================================================
         recent_20 = df_d.iloc[-20:]
         recent_10 = df_d.iloc[-10:]
@@ -204,29 +208,27 @@ def analyze_stock(code):
         range_10 = (recent_10['High'].max() - recent_10['Low'].min()) / current_price * 100.0
         range_5 = (recent_5['High'].max() - recent_5['Low'].min()) / current_price * 100.0
 
-        # 20일 전 대비 고점 발생 여부 및 하향 슬로프 계산
         high_20d_idx = recent_20['High'].values.argmax()
         is_flag_shape = (high_20d_idx < 15) and (recent_5['High'].max() < recent_20['High'].max())
         is_contracting = (range_20 >= range_10) and (range_10 >= range_5)
 
         pattern_score = 5
-        # 1. 상승깃발형 (고점 형성 후 하향 채널로 진폭 좁히며 거래량 마름)
-        if is_flag_shape and range_5 <= 6.5 and vol_50_under:
-            pattern_tag = f"🚩 정석 상승깃발형 (진폭: 20일 {range_20:.1f}%→5일 {range_5:.1f}% | 50일거래하회)"
+        if is_above_ma20 and (is_flag_shape or is_contracting) and range_5 <= 7.0 and vol_50_under:
+            pattern_tag = f"🚩 정석 깃발/VCP 돌파임박 (진폭 {range_5:.1f}% | 20일선 위)"
             pattern_score = 25
-        # 2. VCP 수평 압축 (고점 부근에서 삼각수렴하며 진폭 축소)
-        elif is_contracting and range_5 <= 6.5 and vol_50_under:
-            pattern_tag = f"💎 완벽 VCP 수렴 (진폭: 20일 {range_20:.1f}%→5일 {range_5:.1f}% | 50일거래하회)"
-            pattern_score = 25
-        elif (is_flag_shape or is_contracting) and range_5 <= 8.0:
-            pattern_tag = f"⚡️ 깃발/VCP 압축 진행 (5일 진폭 {range_5:.1f}%)"
-            pattern_score = 18
-        elif range_5 <= 5.5:
+        elif (is_flag_shape or is_contracting) and range_5 <= 8.5:
+            if is_above_ma20:
+                pattern_tag = f"⚡️ 깃발/VCP 압축 진행 (5일 진폭 {range_5:.1f}%)"
+                pattern_score = 20
+            else:
+                pattern_tag = f"🛡 30주선 지지/첫반등 (5일 진폭 {range_5:.1f}% | 20일선 회복중)"
+                pattern_score = 14
+        elif range_5 <= 6.0:
             pattern_tag = f"🌀 단기 초미세 수렴 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 12
         else:
             pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
-            pattern_score = 5
+            pattern_score = 6
 
         # 등락률 및 모멘텀
         chg_pct = ((current_price - prev_close) / prev_close) * 100.0
@@ -294,7 +296,7 @@ def analyze_stock(code):
         return None
 
 results = []
-log(f"[*] 총 {len(target_tickers)}개 종목 상승깃발형 & VCP 스캔 중...")
+log(f"[*] 총 {len(target_tickers)}개 종목 분석 중...")
 
 with ThreadPoolExecutor(max_workers=15) as executor:
     future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
@@ -332,7 +334,7 @@ if results:
         elif r['vol_ratio_sma50'] <= 100.0: score += 8
         else: score += 3
 
-        # 4. 상승깃발형 / VCP 패턴 완성도 (25점)
+        # 4. 차트 패턴 완성도 (25점)
         score += r['pattern_score']
 
         # 5. 수급 가산점 (10점)
@@ -344,10 +346,8 @@ if results:
 
     df_res = pd.DataFrame(final_results)
 
-    # 1. 종합 1위 (최우선 패턴 완성주)
     top_leader = df_res.sort_values(by=['score', 'm_rs'], ascending=[False, False]).iloc[0]
 
-    # 2. Mansfield RS 1위 (초강세주)
     df_indie = df_res[df_res['code'] != top_leader['code']]
     rs_alpha = None
     if not df_indie.empty:
@@ -375,11 +375,12 @@ if results:
         msg += f"   - 거래량: 50일이평비 {rs_alpha['vol_ratio_sma50']}% [{bar_i}]\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False])
+    df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False]).reset_index(drop=True)
     msg += f"\n📋 [포착 종목 전체 랭킹] (총 {len(df_sorted)}개)\n"
-    for _, r in df_sorted.iterrows():
+    for idx, r in df_sorted.iterrows():
+        rank = idx + 1
         bar = make_vol_bar(r['vol_ratio_sma50'])
-        msg += f"• {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']}]\n"
+        msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']}]\n"
         msg += f"   - 패턴: {r['pattern_tag']}\n"
         msg += f"   - 수급: {r['investor']}\n"
         msg += f"   - 상대강도: {r['rs']}\n"
