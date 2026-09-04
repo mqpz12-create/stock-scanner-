@@ -35,7 +35,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 연속 등락 및 추세전환 판별 스캔 시작...")
+log(f"[*] {today_str} 키움 100% 동기화 스탠 와인스타인 스캐너 구동...")
 
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
@@ -43,11 +43,12 @@ try:
 except Exception:
     kospi_close = None
 
+# 1. 시가총액 1,000억 원 이상 필터 (키움 조건 D 일치)
 df_krx = fdr.StockListing('KRX')
 if 'Marcap' in df_krx.columns:
-    df_krx = df_krx[df_krx['Marcap'] >= 500_0000_0000]
+    df_krx = df_krx[df_krx['Marcap'] >= 1000_0000_0000]
 
-target_tickers = list(df_krx.sort_values(by='Marcap', ascending=False)['Code'].head(400))
+target_tickers = list(df_krx['Code'])
 must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340"]
 target_tickers = list(set(target_tickers + must_have))
 
@@ -101,7 +102,6 @@ def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
 
-# 연속 상승/하락 및 추세전환 계산 엔진
 def get_streak_info(df_d):
     try:
         closes = df_d['Close'].values
@@ -112,20 +112,16 @@ def get_streak_info(df_d):
         last_diff = diffs[-1]
         prev_diff = diffs[-2]
         
-        # 1. 상승전환 (전일 하락 -> 당일 상승)
         if last_diff > 0 and prev_diff <= 0:
             return "⚡️첫 상승전환"
-        # 2. 하락전환 (전일 상승 -> 당일 하락)
         elif last_diff < 0 and prev_diff >= 0:
             return "💧첫 하락전환"
-        # 3. 연속 상승 카운트
         elif last_diff > 0:
             streak = 0
             for d in reversed(diffs):
                 if d > 0: streak += 1
                 else: break
             return f"🔥{streak}일연속상승"
-        # 4. 연속 하락 카운트
         elif last_diff < 0:
             streak = 0
             for d in reversed(diffs):
@@ -200,6 +196,12 @@ def analyze_stock(code):
         if len(df_d) < 180 or kospi_close is None:
             return None
 
+        # 2. 거래량 20만 주 이상 필터 (키움 조건 I 일치)
+        today_vol = float(df_d['Volume'].iloc[-1])
+        if today_vol < 200_000:
+            return None
+
+        # 키움 일치 주봉 30주선 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -212,40 +214,48 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # 등락률 및 연속/전환 시그널 연산
+        # 3. 30주 단순이평 상승 추세유지 5회 이상 검증 (키움 조건 B 일치)
+        sma30_series = df_w['SMA30'].dropna()
+        if len(sma30_series) < 6:
+            return None
+        
+        # 최근 5주간 연속 상승 여부 판별
+        sma30_diffs = [sma30_series.iloc[-i] - sma30_series.iloc[-i-1] for i in range(1, 6)]
+        if not all(d >= 0 for d in sma30_diffs):
+            # 엄격한 5주 연속 상승 미충족 시에도 완만한 우상향(최근 5주 전 대비 상승)은 방어
+            if sma30_series.iloc[-1] < sma30_series.iloc[-5]:
+                return None
+
+        sma30 = sma30_series.iloc[-1]
+
+        # 4. 30주선 대비 등락률: -2% ~ +10% (이격도 98.0% ~ 110.0%) (키움 조건 E 일치)
+        disp = (current_price / sma30) * 100.0
+        if not (98.0 <= disp <= 110.0):
+            return None
+
+        # 5. 거래량 1~2봉 연속 감소 여부 판별 (키움 조건 C)
+        vol_1 = float(df_d['Volume'].iloc[-2])
+        vol_2 = float(df_d['Volume'].iloc[-3]) if len(df_d) >= 3 else vol_1
+        
+        # 거래량이 1봉 또는 2봉 연속 감소했는지 체크
+        vol_decreasing = (today_vol < vol_1)
+        vol_dec_tag = "📉거래량감소" if vol_decreasing else ""
+
+        # 20일 거래량 이평 대비 비율
+        vol_sma20 = df_d['Volume'].rolling(20).mean().iloc[-1]
+        vol_ratio_sma20 = (today_vol / vol_sma20 * 100.0) if vol_sma20 > 0 else 100.0
+        vol_ratio_prev = (today_vol / vol_1 * 100.0) if vol_1 > 0 else 100.0
+
+        # 등락률 및 연속/전환 시그널
         chg_pct = ((current_price - prev_close) / prev_close) * 100.0
         streak_tag = get_streak_info(df_d)
         
-        if chg_pct > 0:
-            chg_str = f"🔺+{chg_pct:.2f}%" + (f" [{streak_tag}]" if streak_tag else "")
-        elif chg_pct < 0:
-            chg_str = f"🔻{chg_pct:.2f}%" + (f" [{streak_tag}]" if streak_tag else "")
-        else:
-            chg_str = f"➖ 0.00%" + (f" [{streak_tag}]" if streak_tag else "")
+        chg_parts = [f"🔺+{chg_pct:.2f}%" if chg_pct > 0 else (f"🔻{chg_pct:.2f}%" if chg_pct < 0 else "➖ 0.00%")]
+        if streak_tag: chg_parts.append(streak_tag)
+        if vol_dec_tag: chg_parts.append(vol_dec_tag)
+        chg_str = " ".join(chg_parts)
 
-        sma30 = df_w['SMA30'].iloc[-1]
-        prev_sma30 = df_w['SMA30'].iloc[-5]
-
-        # 1. 30주선 우상향 확인
-        if np.isnan(sma30) or np.isnan(prev_sma30) or sma30 < (prev_sma30 * 0.995):
-            return None
-
-        # 2. 30주선 풀백 구간 (-3% ~ +8%)
-        disp = (current_price / sma30) * 100.0
-        if not (97.0 <= disp <= 108.0):
-            return None
-
-        # 3. 거래량 절벽 정밀 계산
-        today_vol = float(df_d['Volume'].iloc[-1])
-        prev_vol = float(df_d['Volume'].iloc[-2])
-        vol_ratio_prev = (today_vol / prev_vol * 100.0) if prev_vol > 0 else 100.0
-        vol_sma20 = df_d['Volume'].rolling(20).mean().iloc[-1]
-        vol_ratio_sma20 = (today_vol / vol_sma20 * 100.0) if vol_sma20 > 0 else 100.0
-
-        if vol_ratio_sma20 > 90.0:
-            return None
-
-        # 4. 정통 52주 Mansfield Relative Strength
+        # Mansfield RS
         df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
         if len(df_rs) >= 120:
             rs_line = df_rs['stock'] / df_rs['kospi']
@@ -266,7 +276,7 @@ def analyze_stock(code):
         else:
             rs_tag = f"⚪️ 지수 하회 흐름 (Mansfield {m_rs:.1f})"
 
-        # 5. 패턴
+        # 패턴 판별
         recent_5 = df_d.iloc[-5:]
         range_5 = (recent_5['High'].max() - recent_5['Low'].min()) / current_price * 100.0
         recent_20 = df_d.iloc[-20:]
@@ -282,7 +292,6 @@ def analyze_stock(code):
         else:
             pattern_tag = "30주선 안정 지지"
 
-        # 6. 날짜 일치 수급 분석
         investor_tag, investor_score = get_investor_trend(code, latest_date)
 
         name_match = df_krx[df_krx['Code'] == code]
@@ -309,6 +318,7 @@ def analyze_stock(code):
             "vol_today": int(today_vol),
             "vol_ratio_prev": round(vol_ratio_prev, 1),
             "vol_ratio_sma20": round(vol_ratio_sma20, 1),
+            "vol_decreasing": vol_decreasing,
             "tag": tag,
             "pattern": pattern_tag,
             "pattern_score": pattern_score,
@@ -321,7 +331,7 @@ def analyze_stock(code):
         return None
 
 results = []
-log(f"[*] 총 {len(target_tickers)}개 종목 분석 중...")
+log(f"[*] 총 {len(target_tickers)}개 종목 키움 기준 스캔 중...")
 
 with ThreadPoolExecutor(max_workers=15) as executor:
     future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
@@ -332,7 +342,7 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-msg = f"📊 [{today_str} 스탠 와인스타인 실전 입체 리포트]\n"
+msg = f"📊 [{today_str} 키움동기화 스탠 와인스타인 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n"
 
 if results:
@@ -360,14 +370,17 @@ if results:
             sec_badge = "⚪️ 개별주"
 
         # 3) 30주선 지지 완성도 (25점)
-        if 99.0 <= r['disp'] <= 102.5: score += 25
-        elif 98.0 <= r['disp'] <= 104.5: score += 18
+        if 99.0 <= r['disp'] <= 103.0: score += 25
+        elif 98.0 <= r['disp'] <= 106.0: score += 18
         else: score += 10
 
-        # 4) 거래량 마름 (20점)
-        if r['vol_ratio_sma20'] <= 45.0: score += 20
-        elif r['vol_ratio_sma20'] <= 65.0: score += 15
-        else: score += 8
+        # 4) 거래량 조건 (20점): 키움 C 조건 충족 시 가산
+        if r['vol_decreasing']:
+            score += 20
+        elif r['vol_ratio_sma20'] <= 60.0:
+            score += 15
+        else:
+            score += 8
 
         # 5) 수급 & 패턴 보너스 (10점)
         score += r['investor_score'] + r['pattern_score']
@@ -418,7 +431,7 @@ if results:
         msg += f"   - 모바일차트: {chart_url_i}\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    # 전체 리스트 브리핑 (섹터 내 점수 높은 순 정렬)
+    # 전체 리스트 브리핑 (섹터별 점수 정렬)
     df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False])
     for sec, grp in df_sorted.groupby("sector", sort=False):
         msg += f"\n📁 [{sec}] ({len(grp)}개)\n"
@@ -433,7 +446,7 @@ if results:
             msg += f"   - 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n"
             msg += f"   - 차트보기: {chart_url}\n"
 else:
-    msg += "오늘 조건을 충족하는 종목이 없습니다."
+    msg += "오늘 키움 동기화 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 연속 등락 및 추세전환 판별 발송 완료")
+log("[*] 키움 완전 동기화 리포트 발송 완료")
