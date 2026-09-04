@@ -35,7 +35,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 무탈락 입체 VCP & 30주선 스캐너 구동...")
+log(f"[*] {today_str} 정밀 30주선 우상향 & VCP 스캐너 구동...")
 
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
@@ -168,15 +168,17 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # 키움 조건 B: 30주선 상승 추세유지 5회 이상
+        # ============================================================
+        # 키움 조건 B 엄격 적용: 30주선 최근 5주 연속 완벽 우상향 검증
+        # ============================================================
         sma30_series = df_w['SMA30'].dropna()
         if len(sma30_series) < 6:
             return None
         
+        # 최근 5주간 30주선이 단 1회라도 전주 대비 꺾였거나 하락 중이면 즉시 탈락
         sma30_diffs = [sma30_series.iloc[-i] - sma30_series.iloc[-i-1] for i in range(1, 6)]
-        if not all(d >= 0 for d in sma30_diffs):
-            if sma30_series.iloc[-1] < sma30_series.iloc[-5]:
-                return None
+        if not all(d > 0 for d in sma30_diffs):
+            return None
 
         sma30 = sma30_series.iloc[-1]
 
@@ -193,13 +195,10 @@ def analyze_stock(code):
         vol_1 = float(df_d['Volume'].iloc[-2])
         vol_ratio_prev = (today_vol / vol_1 * 100.0) if vol_1 > 0 else 100.0
 
-        # 단기 이평선(20일선) 위치 판별 (탈락 대신 가산점 적용용)
         ma20 = df_d['Close'].rolling(20).mean().iloc[-1]
         is_above_ma20 = (current_price >= ma20)
 
-        # ============================================================
-        # 상승깃발형 & VCP 통합 패턴 엔진 (무탈락 입체 판정)
-        # ============================================================
+        # 깃발형 & VCP 통합 패턴 엔진
         recent_20 = df_d.iloc[-20:]
         recent_10 = df_d.iloc[-10:]
         recent_5 = df_d.iloc[-5:]
@@ -390,4 +389,4 @@ else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 리포트 발송 완료")
+log("[*] 순번 정렬 리포트 발송 완료")
