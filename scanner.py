@@ -36,7 +36,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 와인스타인 원전 기준 VCP & 매수 타점 스캐너 구동...")
+log(f"[*] {today_str} 슈팅 직전 선취매 포착 VCP 스캐너 구동...")
 
 # 1. 네이버 당일 주도 테마 TOP 10 수집
 top_themes = []
@@ -82,7 +82,8 @@ if 'Marcap' in df_krx.columns:
     df_krx = df_krx[df_krx['Marcap'] >= 1000_0000_0000]
 
 target_tickers = list(df_krx['Code'])
-must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340"]
+# 인텍플러스(064290) must_have 정식 등록
+must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340", "064290"]
 target_tickers = list(set(target_tickers + must_have))
 
 def make_vol_bar(ratio_pct):
@@ -186,7 +187,6 @@ def analyze_stock(code):
         if len(df_w) < 35:
             return None
 
-        # 주봉 5주선 및 30주선
         df_w['SMA5'] = df_w['Close'].rolling(5).mean()
         df_w['SMA30'] = df_w['Close'].rolling(30).mean()
 
@@ -194,7 +194,7 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # 1. 30주선 5주 연속 우상향 검증
+        # 30주선 5주 연속 우상향 검증
         sma30_series = df_w['SMA30'].dropna()
         if len(sma30_series) < 6:
             return None
@@ -205,16 +205,16 @@ def analyze_stock(code):
 
         sma30 = sma30_series.iloc[-1]
 
-        # 2. 30주선 이격도 (-2% ~ +10%)
+        # 30주선 이격도 (-2% ~ +10%)
         disp = (current_price / sma30) * 100.0
         if not (98.0 <= disp <= 110.0):
             return None
 
-        # 3. 주봉 5주선 매물벽 검증 (머리 위 저항선 배제)
+        # 주봉 5주선 매물벽 검증
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
 
-        # 4. 거래량 50일 이평 하회
+        # 거래량 50일 이평 하회 검증
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
         vol_ratio_sma50 = (today_vol / vol_sma50 * 100.0) if vol_sma50 > 0 else 100.0
         vol_50_under = (today_vol < vol_sma50)
@@ -222,7 +222,7 @@ def analyze_stock(code):
         vol_1 = float(df_d['Volume'].iloc[-2])
         vol_ratio_prev = (today_vol / vol_1 * 100.0) if vol_1 > 0 else 100.0
 
-        # 5. VCP 진폭 수축 분석
+        # VCP 진폭 수축 분석
         recent_20 = df_d.iloc[-20:]
         recent_10 = df_d.iloc[-10:]
         recent_5 = df_d.iloc[-5:]
@@ -254,12 +254,16 @@ def analyze_stock(code):
             pattern_score = 4
 
         # ============================================================
-        # 6. 피벗 돌파 매수 타점 계산 (5주선은 '상방 개방' 여부로만 검증)
+        # [핵심] 슈팅 직전(Pre-Breakout) 선취매 타점 판별
         # ============================================================
-        pivot_high = int(recent_10['High'].max()) # 최근 10일 피벗 고점
+        pivot_high = int(recent_10['High'].max())
         dist_to_pivot = ((pivot_high - current_price) / current_price) * 100.0
 
-        if is_above_w5 and dist_to_pivot <= 3.0 and vol_50_under:
+        # 인텍플러스 목요일 자리: 5주선 위 + 거래량 40% 이하 마름 + 진폭 7% 이내 + 피벗 2.5% 접근
+        if is_above_w5 and vol_ratio_sma50 <= 45.0 and range_5 <= 7.0 and dist_to_pivot <= 2.5:
+            buy_trigger_str = f"🚨 [슈팅직전 셋업완료] 피벗 {pivot_high:,}원 돌파 시 즉시발사 (선취매 유효구간)"
+            trigger_score = 15
+        elif is_above_w5 and dist_to_pivot <= 3.5 and vol_50_under:
             buy_trigger_str = f"🎯 돌파매수 대기 (10일 피벗 {pivot_high:,}원 돌파 시)"
             trigger_score = 10
         elif is_above_w5:
@@ -269,7 +273,7 @@ def analyze_stock(code):
             buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
             trigger_score = 0
 
-        # 장기(250일) + 단기(60일) 듀얼 Mansfield RS
+        # 장·단기 듀얼 Mansfield RS
         df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
         if len(df_rs) >= 120:
             rs_line = df_rs['stock'] / df_rs['kospi']
@@ -368,22 +372,22 @@ if results:
     for _, r in df_res.iterrows():
         score = 0
         
-        # 1. 듀얼 Mansfield RS (30점 만점)
-        if r['m_rs_long'] > 0 and r['m_rs_short'] > 0: score += 30
-        elif r['m_rs_long'] > 0: score += 15
+        # 1. 듀얼 Mansfield RS (25점 만점)
+        if r['m_rs_long'] > 0 and r['m_rs_short'] > 0: score += 25
+        elif r['m_rs_long'] > 0: score += 12
 
-        # 2. 머리 위 저항 배제 / 주봉 5주선 위 안착 (20점 만점)
+        # 2. 주봉 5주선 위 안착 / 머리 위 저항 배제 (20점 만점)
         if r['is_above_w5']: score += 20
         else: score += 5
 
         # 3. 50일 거래량 마름 (20점 만점)
-        if r['vol_ratio_sma50'] <= 50.0: score += 20
+        if r['vol_ratio_sma50'] <= 45.0: score += 20
         elif r['vol_50_under']: score += 12
 
         # 4. 차트 패턴 수축 (10점 만점)
         score += int(round(r['pattern_score'] * 0.67))
 
-        # 5. 피벗 돌파 준비 상태 (10점 만점)
+        # 5. [신규] 슈팅 직전 선취매 상태 가산점 (15점 만점)
         score += r['trigger_score']
 
         # 6. 30주선 이격 밀착도 (10점 만점)
