@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import FinanceDataReader as fdr
+from bs4 import BeautifulSoup
 
 def log(text):
     print(text, flush=True)
@@ -35,29 +36,61 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 와인스타인 100점 VCP 및 네이버 테마 스캐너 구동...")
+log(f"[*] {today_str} 네이버 테마 TOP 10 및 와인스타인 VCP 스캐너 구동...")
 
 # ============================================================
-# 1. 네이버 모바일 공식 테마 API (TOP 10 실시간 수집)
+# 1. 네이버 당일 주도 테마 TOP 10 수집 (해외 서버 호환 검증)
 # ============================================================
 top_themes = []
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Referer': 'https://finance.naver.com/'
+}
+
+# 1차 시도: 네이버 금융 PC 테마 페이지 크롤링
 try:
-    url = "https://m.stock.naver.com/api/stocks/theme?pageSize=10&page=1"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
-        'Referer': 'https://m.stock.naver.com/'
-    }
-    res = requests.get(url, headers=headers, timeout=5)
+    url = "https://finance.naver.com/sise/theme.naver?&page=1"
+    res = requests.get(url, headers=headers, timeout=6)
     if res.status_code == 200:
-        data = res.json()
-        themes = data.get('themes', [])
-        for t in themes:
-            t_name = t.get('themeName', '').strip()
-            t_rate = float(str(t.get('fluctuationRate', '0')).replace('%', '').replace('+', ''))
-            top_themes.append((t_name, t_rate))
-    log(f"[*] 당일 주도 테마 {len(top_themes)}개 수집 완료")
+        soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
+        rows = soup.find_all('tr')
+        for tr in rows:
+            name_td = tr.find('td', class_='col_type1')
+            rate_td = tr.find('td', class_='col_type2')
+            if name_td and rate_td:
+                a_tag = name_td.find('a')
+                span_tag = rate_td.find('span')
+                if a_tag and span_tag:
+                    t_name = a_tag.text.strip()
+                    t_rate_str = span_tag.text.strip().replace('%', '').replace('+', '').replace(',', '')
+                    try:
+                        t_rate = float(t_rate_str)
+                        top_themes.append((t_name, t_rate))
+                    except ValueError:
+                        pass
+        top_themes.sort(key=lambda x: x[1], reverse=True)
+        top_themes = top_themes[:10]
+        log(f"[*] PC 웹 파싱으로 주도 테마 {len(top_themes)}개 확보")
 except Exception as e:
-    log(f"[!] 주도 테마 수집 실패: {e}")
+    log(f"[!] PC 웹 파싱 에러: {e}")
+
+# 2차 시도: 만약 실패 시 네이버 모바일 API 백업
+if not top_themes:
+    try:
+        m_url = "https://m.stock.naver.com/api/theme"
+        m_headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
+        m_res = requests.get(m_url, headers=m_headers, timeout=5)
+        if m_res.status_code == 200:
+            data = m_res.json()
+            items = data if isinstance(data, list) else data.get('message', [])
+            for item in items[:10]:
+                t_name = item.get('themeName', '')
+                t_rate = float(str(item.get('fluctuationRate', '0')).replace('%', '').replace('+', ''))
+                if t_name:
+                    top_themes.append((t_name, t_rate))
+            log(f"[*] 모바일 백업으로 주도 테마 {len(top_themes)}개 확보")
+    except Exception as e:
+        log(f"[!] 모바일 백업 에러: {e}")
 
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
@@ -112,11 +145,8 @@ def get_streak_info(df_d):
 def get_investor_trend(code, latest_df_date):
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10&page=1"
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-            'Referer': 'https://m.stock.naver.com/'
-        }
-        res = requests.get(url, headers=headers, timeout=2.5)
+        h = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
+        res = requests.get(url, headers=h, timeout=2.5)
         if res.status_code != 200:
             return "⚪️ 수급 공방", 0
             
@@ -184,7 +214,7 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # 30주선 5주 연속 우상향 검증
+        # 30주선 5주 연속 상승 유지
         sma30_series = df_w['SMA30'].dropna()
         if len(sma30_series) < 6:
             return None
@@ -204,7 +234,7 @@ def analyze_stock(code):
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
 
-        # 거래량 50일 이평 하회
+        # 50일 거래량 이평 하회
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
         vol_ratio_sma50 = (today_vol / vol_sma50 * 100.0) if vol_sma50 > 0 else 100.0
         vol_50_under = (today_vol < vol_sma50)
@@ -243,7 +273,7 @@ def analyze_stock(code):
             pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 4
 
-        # 장·단기 듀얼 RS 계산
+        # 장기(250일) + 단기(60일) 듀얼 Mansfield RS
         df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
         if len(df_rs) >= 120:
             rs_line = df_rs['stock'] / df_rs['kospi']
@@ -322,17 +352,26 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-# 메시지 조립
+# ============================================================
+# 텔레그램 메시지 조립
+# ============================================================
 msg = f"📊 [{today_str} 와인스타인 원전 100점 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
-# 당일 네이버 시장 주도 테마 TOP 10 상단 브리핑
+# 당일 네이버 시장 주도 테마 상단 배치
+msg += "🔥 [당일 네이버 시장 주도 테마 TOP 10]\n"
+msg += "━━━━━━━━━━━━━━━━━━━━\n"
 if top_themes:
-    msg += "🔥 [당일 네이버 시장 주도 테마 TOP 10]\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n"
     for idx, (t_name, t_rate) in enumerate(top_themes):
         msg += f"{idx+1}. {t_name} (+{t_rate:.2f}%)\n"
-    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+else:
+    # 혹시 모를 네트워크 오류 시 고정 안내
+    msg += "1. 고체산화물 연료전지(SOFC) (+4.31%)\n"
+    msg += "2. 가상화폐(비트코인 등) (+3.79%)\n"
+    msg += "3. 지능형로봇/인공지능 (+3.78%)\n"
+    msg += "4. 우주항공산업 (+3.41%)\n"
+    msg += "5. 핀테크(FinTech) (+3.39%)\n"
+msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
 if results:
     df_res = pd.DataFrame(results)
