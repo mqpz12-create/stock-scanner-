@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import FinanceDataReader as fdr
+from bs4 import BeautifulSoup
 
 def log(text):
     print(text, flush=True)
@@ -35,7 +36,32 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 정밀 30주선 우상향 & VCP 스캐너 구동...")
+log(f"[*] {today_str} 네이버 실시간 테마별 그룹핑 VCP 스캐너 구동...")
+
+# ============================================================
+# 네이버 실시간 테마 등락률 일괄 크롤링 (당일 상위 40개 테마 수집)
+# ============================================================
+theme_rate_dict = {}
+try:
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    for page in range(1, 4):
+        url = f"https://finance.naver.com/sise/theme.naver?&page={page}"
+        resp = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        rows = soup.select('table.theme tbody tr')
+        for r in rows:
+            col_name = r.select_one('td.col_type1 a')
+            col_rate = r.select_one('td.col_type2 span')
+            if col_name and col_rate:
+                t_name = col_name.text.strip()
+                t_rate_str = col_rate.text.strip().replace('%', '').replace('+', '')
+                try:
+                    theme_rate_dict[t_name] = float(t_rate_str)
+                except ValueError:
+                    pass
+    log(f"[*] 네이버 테마 {len(theme_rate_dict)}개 등락률 수집 완료")
+except Exception as e:
+    log(f"[!] 테마 등락률 수집 실패: {e}")
 
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
@@ -87,14 +113,57 @@ def get_streak_info(df_d):
     except Exception:
         return ""
 
+def get_naver_theme_info(code):
+    try:
+        url = f"https://m.stock.naver.com/api/stock/{code}/integration"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Referer': 'https://m.stock.naver.com/'
+        }
+        res = requests.get(url, headers=headers, timeout=2.5)
+        if res.status_code == 200:
+            data = res.json()
+            themes = data.get('themeList', [])
+            if themes:
+                max_rate = -99.0
+                best_theme_name = ""
+                for t in themes:
+                    t_name = t.get('themeName', '').strip()
+                    if not t_name: continue
+                    rate = theme_rate_dict.get(t_name, 0.0)
+                    if rate > max_rate:
+                        max_rate = rate
+                        best_theme_name = t_name
+
+                if not best_theme_name:
+                    best_theme_name = themes[0].get('themeName', '일반/개별')
+
+                if max_rate >= 3.0:
+                    theme_score = 15
+                    theme_badge = f"🔥주도테마({max_rate:+.2f}%)"
+                elif max_rate >= 1.5:
+                    theme_score = 10
+                    theme_badge = f"🟢강세테마({max_rate:+.2f}%)"
+                elif max_rate >= 0.0:
+                    theme_score = 5
+                    theme_badge = f"⚪️보합테마({max_rate:+.2f}%)"
+                else:
+                    theme_score = 0
+                    theme_badge = f"❄️약세테마({max_rate:+.2f}%)"
+
+                return best_theme_name, max_rate, theme_badge, theme_score
+        return "기타/개별주", -99.0, "⚪️개별", 3
+    except Exception:
+        return "기타/개별주", -99.0, "⚪️개별", 3
+
 def get_investor_trend(code, latest_df_date):
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10&page=1"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
             'Referer': 'https://m.stock.naver.com/'
         }
-        res = requests.get(url, headers=headers, timeout=3)
+        res = requests.get(url, headers=headers, timeout=2.5)
         if res.status_code != 200:
             return "⚪️ 수급 공방 (중립)", 5
             
@@ -150,12 +219,10 @@ def analyze_stock(code):
         if len(df_d) < 180 or kospi_close is None:
             return None
 
-        # 키움 조건 I: 당일 거래량 20만 주 이상
         today_vol = float(df_d['Volume'].iloc[-1])
         if today_vol < 200_000:
             return None
 
-        # 키움 주봉 변환 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -168,26 +235,23 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # ============================================================
-        # 키움 조건 B 엄격 적용: 30주선 최근 5주 연속 완벽 우상향 검증
-        # ============================================================
+        # 30주선 5주 연속 상승 유지 (키움 조건 B 엄격 적용)
         sma30_series = df_w['SMA30'].dropna()
         if len(sma30_series) < 6:
             return None
         
-        # 최근 5주간 30주선이 단 1회라도 전주 대비 꺾였거나 하락 중이면 즉시 탈락
         sma30_diffs = [sma30_series.iloc[-i] - sma30_series.iloc[-i-1] for i in range(1, 6)]
         if not all(d > 0 for d in sma30_diffs):
             return None
 
         sma30 = sma30_series.iloc[-1]
 
-        # 키움 조건 E: 30주선 대비 등락률 -2% ~ +10% (이격도 98.0% ~ 110.0%)
+        # 30주선 이격도 (-2% ~ +10%)
         disp = (current_price / sma30) * 100.0
         if not (98.0 <= disp <= 110.0):
             return None
 
-        # 거래량 50일 이평 계산
+        # 50일 거래량 이평 하회
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
         vol_ratio_sma50 = (today_vol / vol_sma50 * 100.0) if vol_sma50 > 0 else 100.0
         vol_50_under = (today_vol < vol_sma50)
@@ -198,7 +262,7 @@ def analyze_stock(code):
         ma20 = df_d['Close'].rolling(20).mean().iloc[-1]
         is_above_ma20 = (current_price >= ma20)
 
-        # 깃발형 & VCP 통합 패턴 엔진
+        # 깃발형 & VCP 패턴 분석
         recent_20 = df_d.iloc[-20:]
         recent_10 = df_d.iloc[-10:]
         recent_5 = df_d.iloc[-5:]
@@ -259,6 +323,8 @@ def analyze_stock(code):
         else:
             rs_tag = f"⚪️ 지수 하회 (Mansfield {m_rs:.1f})"
 
+        # 네이버 실시간 테마명 및 등락률 파싱
+        theme_name, theme_rate, theme_badge, theme_score = get_naver_theme_info(code)
         investor_tag, investor_score = get_investor_trend(code, latest_date)
 
         name_match = df_krx[df_krx['Code'] == code]
@@ -275,6 +341,10 @@ def analyze_stock(code):
         return {
             "code": code,
             "name": name,
+            "theme_name": theme_name,
+            "theme_rate": theme_rate,
+            "theme_badge": theme_badge,
+            "theme_score": theme_score,
             "price": current_price,
             "chg_str": chg_str,
             "sma30": int(round(sma30)),
@@ -306,7 +376,7 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-msg = f"📊 [{today_str} 상승깃발형 & VCP 정밀 리포트]\n"
+msg = f"📊 [{today_str} 네이버 주도 테마별 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n"
 
 if results:
@@ -315,17 +385,17 @@ if results:
     final_results = []
     for _, r in df_res.iterrows():
         score = 0
-        # 1. Mansfield RS (25점)
-        if r['m_rs'] >= 40.0: score += 25
-        elif r['m_rs'] >= 20.0: score += 20
-        elif r['m_rs'] >= 5.0: score += 15
-        elif r['m_rs'] >= 0.0: score += 10
+        # 1. Mansfield RS (20점)
+        if r['m_rs'] >= 40.0: score += 20
+        elif r['m_rs'] >= 20.0: score += 16
+        elif r['m_rs'] >= 5.0: score += 12
+        elif r['m_rs'] >= 0.0: score += 8
         else: score += 0
 
-        # 2. 30주선 지지 완성도 (25점)
-        if 99.0 <= r['disp'] <= 103.0: score += 25
-        elif 98.0 <= r['disp'] <= 106.0: score += 18
-        else: score += 10
+        # 2. 30주선 지지 완성도 (20점)
+        if 99.0 <= r['disp'] <= 103.0: score += 20
+        elif 98.0 <= r['disp'] <= 106.0: score += 15
+        else: score += 8
 
         # 3. 거래량 50일 이평 하회 & 마름 (15점)
         if r['vol_ratio_sma50'] <= 50.0: score += 15
@@ -333,10 +403,13 @@ if results:
         elif r['vol_ratio_sma50'] <= 100.0: score += 8
         else: score += 3
 
-        # 4. 차트 패턴 완성도 (25점)
-        score += r['pattern_score']
+        # 4. 차트 패턴 완성도 (20점)
+        score += int(round(r['pattern_score'] * 0.8))
 
-        # 5. 수급 가산점 (10점)
+        # 5. 네이버 테마 강세 점수 (15점)
+        score += r['theme_score']
+
+        # 6. 수급 가산점 (10점)
         score += r['investor_score']
 
         r_dict = dict(r)
@@ -345,8 +418,10 @@ if results:
 
     df_res = pd.DataFrame(final_results)
 
+    # 1. 종합 1위
     top_leader = df_res.sort_values(by=['score', 'm_rs'], ascending=[False, False]).iloc[0]
 
+    # 2. Mansfield RS 1위
     df_indie = df_res[df_res['code'] != top_leader['code']]
     rs_alpha = None
     if not df_indie.empty:
@@ -355,8 +430,8 @@ if results:
     msg += "\n🔥 [TODAY'S HIGHLIGHT : 최우선 관심주]\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
     bar_t = make_vol_bar(top_leader['vol_ratio_sma50'])
-    msg += f"🏆 종합 1위 최우선 패턴주\n"
-    msg += f"▶ {top_leader['name']} ({top_leader['price']:,}원 | {top_leader['chg_str']}) [와인스타인+패턴 {top_leader['score']}점]\n"
+    msg += f"🏆 종합 1위 최우선 셋업주\n"
+    msg += f"▶ {top_leader['name']} ({top_leader['price']:,}원 | {top_leader['chg_str']}) [{top_leader['theme_name']} | {top_leader['theme_badge']}] [종합 {top_leader['score']}점]\n"
     msg += f"   - 수급주체: {top_leader['investor']}\n"
     msg += f"   - 차트패턴: {top_leader['pattern_tag']}\n"
     msg += f"   - 상대강도: {top_leader['rs']}\n"
@@ -366,7 +441,7 @@ if results:
     if rs_alpha is not None:
         bar_i = make_vol_bar(rs_alpha['vol_ratio_sma50'])
         msg += f"⚡️ 시장 최고 상대강도주 (Mansfield RS 1위)\n"
-        msg += f"▶ {rs_alpha['name']} ({rs_alpha['price']:,}원 | {rs_alpha['chg_str']}) [와인스타인+패턴 {rs_alpha['score']}점]\n"
+        msg += f"▶ {rs_alpha['name']} ({rs_alpha['price']:,}원 | {rs_alpha['chg_str']}) [{rs_alpha['theme_name']} | {rs_alpha['theme_badge']}] [종합 {rs_alpha['score']}점]\n"
         msg += f"   - 수급주체: {rs_alpha['investor']}\n"
         msg += f"   - 차트패턴: {rs_alpha['pattern_tag']}\n"
         msg += f"   - 상대강도: {rs_alpha['rs']}\n"
@@ -374,19 +449,28 @@ if results:
         msg += f"   - 거래량: 50일이평비 {rs_alpha['vol_ratio_sma50']}% [{bar_i}]\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
 
-    df_sorted = df_res.sort_values(by=["score", "m_rs"], ascending=[False, False]).reset_index(drop=True)
-    msg += f"\n📋 [포착 종목 전체 랭킹] (총 {len(df_sorted)}개)\n"
-    for idx, r in df_sorted.iterrows():
-        rank = idx + 1
-        bar = make_vol_bar(r['vol_ratio_sma50'])
-        msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']}]\n"
-        msg += f"   - 패턴: {r['pattern_tag']}\n"
-        msg += f"   - 수급: {r['investor']}\n"
-        msg += f"   - 상대강도: {r['rs']}\n"
-        msg += f"   - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 50일거래비: {r['vol_ratio_sma50']}% [{bar}]\n"
-        msg += f"   - 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n"
+    # ============================================================
+    # 네이버 실시간 테마 등락률 순 그룹핑 출력
+    # ============================================================
+    # 테마별 최고 등락률 기준으로 테마 순서 정렬
+    theme_order = df_res.groupby('theme_name')['theme_rate'].max().sort_values(ascending=False).index
+
+    for t_name in theme_order:
+        grp = df_res[df_res['theme_name'] == t_name].sort_values(by=['score', 'm_rs'], ascending=[False, False])
+        sample_badge = grp['theme_badge'].iloc[0]
+        msg += f"\n📁 [{t_name}] {sample_badge} ({len(grp)}개)\n"
+        
+        for idx, (_, r) in enumerate(grp.iterrows()):
+            rank = idx + 1
+            bar = make_vol_bar(r['vol_ratio_sma50'])
+            msg += f"  {rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']}]\n"
+            msg += f"     - 패턴: {r['pattern_tag']}\n"
+            msg += f"     - 수급: {r['investor']}\n"
+            msg += f"     - 상대강도: {r['rs']}\n"
+            msg += f"     - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 50일거래비: {r['vol_ratio_sma50']}% [{bar}]\n"
+            msg += f"     - 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n"
 else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 순번 정렬 리포트 발송 완료")
+log("[*] 네이버 테마별 그룹핑 리포트 발송 완료")
