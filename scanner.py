@@ -36,7 +36,7 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 30주선 베이스 유연화 및 VCP 스캐너 구동...")
+log(f"[*] {today_str} 개인 5일 누적 순매도 필터 기반 VCP 스캐너 구동...")
 
 # ============================================================
 # 1. 네이버 당일 주도 테마 TOP 10 수집
@@ -78,13 +78,11 @@ try:
 except Exception:
     kospi_close = None
 
-# 시가총액 1,000억 원 이상
 df_krx = fdr.StockListing('KRX')
 if 'Marcap' in df_krx.columns:
     df_krx = df_krx[df_krx['Marcap'] >= 1000_0000_0000]
 
 target_tickers = list(df_krx['Code'])
-# 핵심 추적주 등록 (SGC에너지, 인텍플러스 등)
 must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340", "064290"]
 target_tickers = list(set(target_tickers + must_have))
 
@@ -124,17 +122,20 @@ def get_streak_info(df_d):
         return ""
 
 def get_investor_trend(code, latest_df_date):
+    """
+    개인 5일 누적 순매도 기반 스마트머니 물량 장악도 판정
+    """
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10&page=1"
         h = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
         res = requests.get(url, headers=h, timeout=2.5)
         if res.status_code != 200:
-            return "⚪️ 수급 공방"
+            return "⚪️ 수급 확인불가", 0
             
         data = res.json()
         trends = data.get('message', []) if isinstance(data, dict) and 'message' in data else data
         if not trends:
-            return "⚪️ 수급 공방"
+            return "⚪️ 수급 확인불가", 0
 
         target_idx = 0
         target_date_str = latest_df_date.strftime("%Y%m%d")
@@ -144,32 +145,46 @@ def get_investor_trend(code, latest_df_date):
                 target_idx = idx
                 break
 
-        item_today = trends[target_idx]
-        today_inst = int(str(item_today.get('institutionPureBuyQuant', '0')).replace(',', ''))
-        today_frgn = int(str(item_today.get('foreignerPureBuyQuant', '0')).replace(',', ''))
-
         slice_5d = trends[target_idx:target_idx+5]
+        
+        # 5일 누적 수량 계산
         inst_5d = sum(int(str(it.get('institutionPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
         frgn_5d = sum(int(str(it.get('foreignerPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
+        
+        # 개인 순매수 데이터 산출 (제공 필드 파싱 또는 제로섬 역산)
+        indiv_list = []
+        for it in slice_5d:
+            if 'individualPureBuyQuant' in it:
+                indiv_list.append(int(str(it.get('individualPureBuyQuant', '0')).replace(',', '')))
+            else:
+                # 필드가 없을 경우 (개인 = -(외인 + 기관)) 역산
+                f_q = int(str(it.get('foreignerPureBuyQuant', '0')).replace(',', ''))
+                i_q = int(str(it.get('institutionPureBuyQuant', '0')).replace(',', ''))
+                indiv_list.append(-(f_q + i_q))
+        
+        indiv_5d = sum(indiv_list)
+        smart_money_5d = frgn_5d + inst_5d
 
-        date_prefix = "" if target_idx == 0 else f"[{trends[target_idx].get('bizdate','')}] "
-
-        if today_inst > 0 and today_frgn > 0:
-            tag = f"{date_prefix}🔥 쌍끌이매수 (외인+{today_frgn:,} / 기관+{today_inst:,}) | 5일누적({frgn_5d+inst_5d:,})"
-        elif today_frgn < 0 and frgn_5d > 0:
-            tag = f"{date_prefix}⚠️ 외인 당일매도({today_frgn:,}) | 5일누적(+{frgn_5d:,})"
-        elif today_frgn > 0 and today_inst <= 0:
-            tag = f"{date_prefix}💎 외인 당일매집(+{today_frgn:,}) | 5일누적({frgn_5d:,})"
-        elif today_inst > 0 and today_frgn <= 0:
-            tag = f"{date_prefix}⭐️ 기관 당일매집(+{today_inst:,}) | 5일누적({inst_5d:,})"
-        elif today_inst < 0 and today_frgn < 0:
-            tag = f"{date_prefix}⛔️ 외인·기관 동반매도 (외인{today_frgn:,} / 기관{today_inst:,})"
+        # 팩트 판정 로직
+        if indiv_5d < 0 and smart_money_5d > 0:
+            tag = f"💎 [스마트머니 장악] 개인 5일 누적 매도({indiv_5d:,}주) | 외인·기관 흡수(+{smart_money_5d:,}주)"
+            score = 10
+        elif indiv_5d < 0:
+            tag = f"💎 [개미 이탈] 개인 5일 누적 매도({indiv_5d:,}주) | 잠재매물 감소"
+            score = 6
+        elif inst_5d < 0 and frgn_5d > 0:
+            tag = f"⚠️ [수급 공방/기관출회] 외인(+{frgn_5d:,}) vs 기관(-{abs(inst_5d):,}) | 핑퐁주의"
+            score = -5
+        elif indiv_5d > 0:
+            tag = f"⚠️ [개미 유입] 개인 5일 누적 매수(+{indiv_5d:,}주) | 매물 저항 부담"
+            score = -10
         else:
-            tag = f"{date_prefix}⚪️ 수급 공방 (외인{today_frgn:,} / 기관{today_inst:,})"
+            tag = "⚪️ 수급 중립 공방"
+            score = 0
 
-        return tag
+        return tag, score
     except Exception:
-        return "⚪️ 수급 공방"
+        return "⚪️ 수급 확인불가", 0
 
 def analyze_stock(code):
     try:
@@ -181,7 +196,6 @@ def analyze_stock(code):
         if today_vol < 200_000:
             return None
 
-        # 키움 주봉 변환 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -200,26 +214,20 @@ def analyze_stock(code):
         if len(sma30_series) < 8:
             return None
 
-        # ============================================================
-        # [수정] 와인스타인 원전 30주선 베이스 유연화
-        # 단 1주라도 보합이면 날리던 조건을, '최근 3주 및 5주 대비 상승세 유지'로 보정
-        # ============================================================
+        # 와인스타인 원전: 최근 3주 및 5주 대비 우상향 유지
         is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3]) and (sma30_series.iloc[-1] > sma30_series.iloc[-6])
         if not is_sma30_uptrend:
             return None
 
         sma30 = sma30_series.iloc[-1]
 
-        # 30주선 이격도 (-2% ~ +10%)
         disp = (current_price / sma30) * 100.0
         if not (98.0 <= disp <= 110.0):
             return None
 
-        # 주봉 5주선 매물벽 검증
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
 
-        # 거래량 50일 이평 하회 검증
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
         vol_ratio_sma50 = (today_vol / vol_sma50 * 100.0) if vol_sma50 > 0 else 100.0
         vol_50_under = (today_vol < vol_sma50)
@@ -227,7 +235,6 @@ def analyze_stock(code):
         vol_1 = float(df_d['Volume'].iloc[-2])
         vol_ratio_prev = (today_vol / vol_1 * 100.0) if vol_1 > 0 else 100.0
 
-        # VCP 진폭 수축 분석
         recent_20 = df_d.iloc[-20:]
         recent_10 = df_d.iloc[-10:]
         recent_5 = df_d.iloc[-5:]
@@ -258,7 +265,6 @@ def analyze_stock(code):
             pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 4
 
-        # 피벗 돌파 매수 타점 계산
         pivot_high = int(recent_10['High'].max())
         dist_to_pivot = ((pivot_high - current_price) / current_price) * 100.0
 
@@ -275,11 +281,9 @@ def analyze_stock(code):
             buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
             trigger_score = 0
 
-        # 장·단기 듀얼 Mansfield RS
         df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
         if len(df_rs) >= 120:
             rs_line = df_rs['stock'] / df_rs['kospi']
-            
             w_long = min(len(df_rs), 250)
             rs_sma_long = rs_line.rolling(w_long, min_periods=60).mean()
             m_rs_long = ((rs_line.iloc[-1] / rs_sma_long.iloc[-1]) - 1.0) * 100.0
@@ -298,7 +302,7 @@ def analyze_stock(code):
         else:
             rs_tag = f"⚪️ 지수 하회 (RS 장기{m_rs_long:.1f} / 단기{m_rs_short:+.1f})"
 
-        investor_tag = get_investor_trend(code, latest_date)
+        investor_tag, investor_score = get_investor_trend(code, latest_date)
 
         chg_pct = ((current_price - prev_close) / prev_close) * 100.0
         streak_tag = get_streak_info(df_d)
@@ -339,7 +343,8 @@ def analyze_stock(code):
             "rs": rs_tag,
             "m_rs_long": m_rs_long,
             "m_rs_short": m_rs_short,
-            "investor": investor_tag
+            "investor": investor_tag,
+            "investor_score": investor_score
         }
     except Exception:
         return None
@@ -356,7 +361,6 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-# 메시지 조립
 msg = f"📊 [{today_str} 와인스타인 원전 100점 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
@@ -397,8 +401,11 @@ if results:
         elif 103.0 < r['disp'] <= 107.0: score += 7
         else: score += 4
 
+        # 7. 개인 5일 누적 순매도(스마트머니 장악도) 반영 (+10점 ~ -10점)
+        score += r['investor_score']
+
         r_dict = dict(r)
-        r_dict['score'] = score
+        r_dict['score'] = max(score, 0)
         final_results.append(r_dict)
 
     df_res = pd.DataFrame(final_results)
