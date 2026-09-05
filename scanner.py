@@ -36,18 +36,15 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 네이버 테마 TOP 10 및 와인스타인 VCP 스캐너 구동...")
+log(f"[*] {today_str} 와인스타인 원전 기준 VCP & 매수 타점 스캐너 구동...")
 
-# ============================================================
-# 1. 네이버 당일 주도 테마 TOP 10 수집 (해외 서버 호환 검증)
-# ============================================================
+# 1. 네이버 당일 주도 테마 TOP 10 수집
 top_themes = []
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Referer': 'https://finance.naver.com/'
 }
 
-# 1차 시도: 네이버 금융 PC 테마 페이지 크롤링
 try:
     url = "https://finance.naver.com/sise/theme.naver?&page=1"
     res = requests.get(url, headers=headers, timeout=6)
@@ -70,27 +67,8 @@ try:
                         pass
         top_themes.sort(key=lambda x: x[1], reverse=True)
         top_themes = top_themes[:10]
-        log(f"[*] PC 웹 파싱으로 주도 테마 {len(top_themes)}개 확보")
 except Exception as e:
-    log(f"[!] PC 웹 파싱 에러: {e}")
-
-# 2차 시도: 만약 실패 시 네이버 모바일 API 백업
-if not top_themes:
-    try:
-        m_url = "https://m.stock.naver.com/api/theme"
-        m_headers = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
-        m_res = requests.get(m_url, headers=m_headers, timeout=5)
-        if m_res.status_code == 200:
-            data = m_res.json()
-            items = data if isinstance(data, list) else data.get('message', [])
-            for item in items[:10]:
-                t_name = item.get('themeName', '')
-                t_rate = float(str(item.get('fluctuationRate', '0')).replace('%', '').replace('+', ''))
-                if t_name:
-                    top_themes.append((t_name, t_rate))
-            log(f"[*] 모바일 백업으로 주도 테마 {len(top_themes)}개 확보")
-    except Exception as e:
-        log(f"[!] 모바일 백업 에러: {e}")
+    log(f"[!] 테마 수집 실패: {e}")
 
 try:
     df_kospi = fdr.DataReader('KS11', start_str)
@@ -148,12 +126,12 @@ def get_investor_trend(code, latest_df_date):
         h = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
         res = requests.get(url, headers=h, timeout=2.5)
         if res.status_code != 200:
-            return "⚪️ 수급 공방", 0
+            return "⚪️ 수급 공방"
             
         data = res.json()
         trends = data.get('message', []) if isinstance(data, dict) and 'message' in data else data
         if not trends:
-            return "⚪️ 수급 공방", 0
+            return "⚪️ 수급 공방"
 
         target_idx = 0
         target_date_str = latest_df_date.strftime("%Y%m%d")
@@ -186,9 +164,9 @@ def get_investor_trend(code, latest_df_date):
         else:
             tag = f"{date_prefix}⚪️ 수급 공방 (외인{today_frgn:,} / 기관{today_inst:,})"
 
-        return tag, 0
+        return tag
     except Exception:
-        return "⚪️ 수급 공방", 0
+        return "⚪️ 수급 공방"
 
 def analyze_stock(code):
     try:
@@ -200,6 +178,7 @@ def analyze_stock(code):
         if today_vol < 200_000:
             return None
 
+        # 키움 주봉 변환 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -207,6 +186,7 @@ def analyze_stock(code):
         if len(df_w) < 35:
             return None
 
+        # 주봉 5주선 및 30주선
         df_w['SMA5'] = df_w['Close'].rolling(5).mean()
         df_w['SMA30'] = df_w['Close'].rolling(30).mean()
 
@@ -214,7 +194,7 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # 30주선 5주 연속 상승 유지
+        # 1. 30주선 5주 연속 우상향 검증
         sma30_series = df_w['SMA30'].dropna()
         if len(sma30_series) < 6:
             return None
@@ -225,16 +205,16 @@ def analyze_stock(code):
 
         sma30 = sma30_series.iloc[-1]
 
-        # 30주선 이격도 (-2% ~ +10%)
+        # 2. 30주선 이격도 (-2% ~ +10%)
         disp = (current_price / sma30) * 100.0
         if not (98.0 <= disp <= 110.0):
             return None
 
-        # 주봉 5주선 지지 여부
+        # 3. 주봉 5주선 매물벽 검증 (머리 위 저항선 배제)
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
 
-        # 50일 거래량 이평 하회
+        # 4. 거래량 50일 이평 하회
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
         vol_ratio_sma50 = (today_vol / vol_sma50 * 100.0) if vol_sma50 > 0 else 100.0
         vol_50_under = (today_vol < vol_sma50)
@@ -242,7 +222,7 @@ def analyze_stock(code):
         vol_1 = float(df_d['Volume'].iloc[-2])
         vol_ratio_prev = (today_vol / vol_1 * 100.0) if vol_1 > 0 else 100.0
 
-        # VCP 수축 분석
+        # 5. VCP 진폭 수축 분석
         recent_20 = df_d.iloc[-20:]
         recent_10 = df_d.iloc[-10:]
         recent_5 = df_d.iloc[-5:]
@@ -264,14 +244,30 @@ def analyze_stock(code):
                 pattern_tag = f"⚡️ 주봉5주선 지지 깃발형 (5일 진폭 {range_5:.1f}%)"
                 pattern_score = 12
             else:
-                pattern_tag = f"🛡 30주선 지지/첫반등 (5일 진폭 {range_5:.1f}% | 5주선 회복중)"
-                pattern_score = 8
+                pattern_tag = f"🛡 30주선 지지/첫반등 (5일 진폭 {range_5:.1f}% | 5주선 매물저항)"
+                pattern_score = 6
         elif range_5 <= 6.0:
             pattern_tag = f"🌀 단기 초미세 수렴 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 8
         else:
             pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 4
+
+        # ============================================================
+        # 6. 피벗 돌파 매수 타점 계산 (5주선은 '상방 개방' 여부로만 검증)
+        # ============================================================
+        pivot_high = int(recent_10['High'].max()) # 최근 10일 피벗 고점
+        dist_to_pivot = ((pivot_high - current_price) / current_price) * 100.0
+
+        if is_above_w5 and dist_to_pivot <= 3.0 and vol_50_under:
+            buy_trigger_str = f"🎯 돌파매수 대기 (10일 피벗 {pivot_high:,}원 돌파 시)"
+            trigger_score = 10
+        elif is_above_w5:
+            buy_trigger_str = f"⏳ 베이스 수축 진행 (피벗 {pivot_high:,}원 | 이격 +{dist_to_pivot:.1f}%)"
+            trigger_score = 5
+        else:
+            buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
+            trigger_score = 0
 
         # 장기(250일) + 단기(60일) 듀얼 Mansfield RS
         df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
@@ -296,7 +292,7 @@ def analyze_stock(code):
         else:
             rs_tag = f"⚪️ 지수 하회 (RS 장기{m_rs_long:.1f} / 단기{m_rs_short:+.1f})"
 
-        investor_tag, _ = get_investor_trend(code, latest_date)
+        investor_tag = get_investor_trend(code, latest_date)
 
         chg_pct = ((current_price - prev_close) / prev_close) * 100.0
         streak_tag = get_streak_info(df_d)
@@ -332,6 +328,8 @@ def analyze_stock(code):
             "tag": tag,
             "pattern_tag": pattern_tag,
             "pattern_score": pattern_score,
+            "buy_trigger_str": buy_trigger_str,
+            "trigger_score": trigger_score,
             "rs": rs_tag,
             "m_rs_long": m_rs_long,
             "m_rs_short": m_rs_short,
@@ -352,26 +350,16 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
-# ============================================================
-# 텔레그램 메시지 조립
-# ============================================================
+# 메시지 조립
 msg = f"📊 [{today_str} 와인스타인 원전 100점 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
-# 당일 네이버 시장 주도 테마 상단 배치
-msg += "🔥 [당일 네이버 시장 주도 테마 TOP 10]\n"
-msg += "━━━━━━━━━━━━━━━━━━━━\n"
 if top_themes:
+    msg += "🔥 [당일 네이버 시장 주도 테마 TOP 10]\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n"
     for idx, (t_name, t_rate) in enumerate(top_themes):
         msg += f"{idx+1}. {t_name} (+{t_rate:.2f}%)\n"
-else:
-    # 혹시 모를 네트워크 오류 시 고정 안내
-    msg += "1. 고체산화물 연료전지(SOFC) (+4.31%)\n"
-    msg += "2. 가상화폐(비트코인 등) (+3.79%)\n"
-    msg += "3. 지능형로봇/인공지능 (+3.78%)\n"
-    msg += "4. 우주항공산업 (+3.41%)\n"
-    msg += "5. 핀테크(FinTech) (+3.39%)\n"
-msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    msg += "━━━━━━━━━━━━━━━━━━━━\n\n"
 
 if results:
     df_res = pd.DataFrame(results)
@@ -380,38 +368,28 @@ if results:
     for _, r in df_res.iterrows():
         score = 0
         
-        # 1. 장·단기 듀얼 Mansfield RS (30점 만점)
-        if r['m_rs_long'] > 0 and r['m_rs_short'] > 0:
-            score += 30
-        elif r['m_rs_long'] > 0:
-            score += 15
-        else:
-            score += 0
+        # 1. 듀얼 Mansfield RS (30점 만점)
+        if r['m_rs_long'] > 0 and r['m_rs_short'] > 0: score += 30
+        elif r['m_rs_long'] > 0: score += 15
 
-        # 2. 머리 위 저항 배제 / 주봉 5주선 지지 (25점 만점)
-        if r['is_above_w5']:
-            score += 25
-        else:
-            score += 5
+        # 2. 머리 위 저항 배제 / 주봉 5주선 위 안착 (20점 만점)
+        if r['is_above_w5']: score += 20
+        else: score += 5
 
-        # 3. 거래량 50일 이평 하회 / 마름 (20점 만점)
-        if r['vol_ratio_sma50'] <= 50.0:
-            score += 20
-        elif r['vol_50_under']:
-            score += 12
-        else:
-            score += 0
+        # 3. 50일 거래량 마름 (20점 만점)
+        if r['vol_ratio_sma50'] <= 50.0: score += 20
+        elif r['vol_50_under']: score += 12
 
-        # 4. 차트 패턴 / VCP 진폭 수축 (15점 만점)
-        score += r['pattern_score']
+        # 4. 차트 패턴 수축 (10점 만점)
+        score += int(round(r['pattern_score'] * 0.67))
 
-        # 5. 30주선 이격 밀착도 (10점 만점)
-        if 99.0 <= r['disp'] <= 103.0:
-            score += 10
-        elif 103.0 < r['disp'] <= 107.0:
-            score += 7
-        else:
-            score += 4
+        # 5. 피벗 돌파 준비 상태 (10점 만점)
+        score += r['trigger_score']
+
+        # 6. 30주선 이격 밀착도 (10점 만점)
+        if 99.0 <= r['disp'] <= 103.0: score += 10
+        elif 103.0 < r['disp'] <= 107.0: score += 7
+        else: score += 4
 
         r_dict = dict(r)
         r_dict['score'] = score
@@ -424,9 +402,10 @@ if results:
     for idx, r in df_sorted.iterrows():
         rank = idx + 1
         bar = make_vol_bar(r['vol_ratio_sma50'])
-        w5_mark = "🟢5주선위" if r['is_above_w5'] else "🟡5주선아래"
+        w5_mark = "🟢5주선위(상방열림)" if r['is_above_w5'] else "🟡5주선아래(매물저항)"
         
         msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']} | {w5_mark}]\n"
+        msg += f"   - 매수타점: {r['buy_trigger_str']}\n"
         msg += f"   - 패턴: {r['pattern_tag']}\n"
         msg += f"   - 수급: {r['investor']}\n"
         msg += f"   - 상대강도: {r['rs']}\n"
