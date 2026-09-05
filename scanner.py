@@ -36,9 +36,11 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 슈팅 직전 선취매 포착 VCP 스캐너 구동...")
+log(f"[*] {today_str} 30주선 베이스 유연화 및 VCP 스캐너 구동...")
 
+# ============================================================
 # 1. 네이버 당일 주도 테마 TOP 10 수집
+# ============================================================
 top_themes = []
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -76,13 +78,13 @@ try:
 except Exception:
     kospi_close = None
 
-# 키움 조건 D: 시가총액 1,000억 원 이상
+# 시가총액 1,000억 원 이상
 df_krx = fdr.StockListing('KRX')
 if 'Marcap' in df_krx.columns:
     df_krx = df_krx[df_krx['Marcap'] >= 1000_0000_0000]
 
 target_tickers = list(df_krx['Code'])
-# 인텍플러스(064290) must_have 정식 등록
+# 핵심 추적주 등록 (SGC에너지, 인텍플러스 등)
 must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340", "064290"]
 target_tickers = list(set(target_tickers + must_have))
 
@@ -194,13 +196,16 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # 30주선 5주 연속 우상향 검증
         sma30_series = df_w['SMA30'].dropna()
-        if len(sma30_series) < 6:
+        if len(sma30_series) < 8:
             return None
-        
-        sma30_diffs = [sma30_series.iloc[-i] - sma30_series.iloc[-i-1] for i in range(1, 6)]
-        if not all(d > 0 for d in sma30_diffs):
+
+        # ============================================================
+        # [수정] 와인스타인 원전 30주선 베이스 유연화
+        # 단 1주라도 보합이면 날리던 조건을, '최근 3주 및 5주 대비 상승세 유지'로 보정
+        # ============================================================
+        is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3]) and (sma30_series.iloc[-1] > sma30_series.iloc[-6])
+        if not is_sma30_uptrend:
             return None
 
         sma30 = sma30_series.iloc[-1]
@@ -253,13 +258,10 @@ def analyze_stock(code):
             pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 4
 
-        # ============================================================
-        # [핵심] 슈팅 직전(Pre-Breakout) 선취매 타점 판별
-        # ============================================================
+        # 피벗 돌파 매수 타점 계산
         pivot_high = int(recent_10['High'].max())
         dist_to_pivot = ((pivot_high - current_price) / current_price) * 100.0
 
-        # 인텍플러스 목요일 자리: 5주선 위 + 거래량 40% 이하 마름 + 진폭 7% 이내 + 피벗 2.5% 접근
         if is_above_w5 and vol_ratio_sma50 <= 45.0 and range_5 <= 7.0 and dist_to_pivot <= 2.5:
             buy_trigger_str = f"🚨 [슈팅직전 셋업완료] 피벗 {pivot_high:,}원 돌파 시 즉시발사 (선취매 유효구간)"
             trigger_score = 15
@@ -376,7 +378,7 @@ if results:
         if r['m_rs_long'] > 0 and r['m_rs_short'] > 0: score += 25
         elif r['m_rs_long'] > 0: score += 12
 
-        # 2. 주봉 5주선 위 안착 / 머리 위 저항 배제 (20점 만점)
+        # 2. 주봉 5주선 위 안착 (20점 만점)
         if r['is_above_w5']: score += 20
         else: score += 5
 
@@ -387,7 +389,7 @@ if results:
         # 4. 차트 패턴 수축 (10점 만점)
         score += int(round(r['pattern_score'] * 0.67))
 
-        # 5. [신규] 슈팅 직전 선취매 상태 가산점 (15점 만점)
+        # 5. 슈팅 직전 선취매 상태 가산점 (15점 만점)
         score += r['trigger_score']
 
         # 6. 30주선 이격 밀착도 (10점 만점)
