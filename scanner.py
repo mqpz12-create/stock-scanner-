@@ -5,7 +5,6 @@ import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import FinanceDataReader as fdr
-from bs4 import BeautifulSoup
 
 def log(text):
     print(text, flush=True)
@@ -36,31 +35,27 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
 
-log(f"[*] {today_str} 와인스타인 원전 가중치 기반 VCP 스캐너 구동...")
+log(f"[*] {today_str} 와인스타인 100점 VCP 및 네이버 테마 스캐너 구동...")
 
-# 1. 네이버 당일 주도 테마 TOP 10 수집
+# ============================================================
+# 1. 네이버 모바일 공식 테마 API (TOP 10 실시간 수집)
+# ============================================================
 top_themes = []
 try:
+    url = "https://m.stock.naver.com/api/stocks/theme?pageSize=10&page=1"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1',
+        'Referer': 'https://m.stock.naver.com/'
     }
-    url = "https://finance.naver.com/sise/theme.naver?&page=1"
-    resp = requests.get(url, headers=headers, timeout=5)
-    soup = BeautifulSoup(resp.content.decode('euc-kr', 'replace'), 'html.parser')
-    rows = soup.select('table.theme tbody tr')
-    for r in rows:
-        col_name = r.select_one('td.col_type1 a')
-        col_rate = r.select_one('td.col_type2 span')
-        if col_name and col_rate:
-            t_name = col_name.text.strip()
-            t_rate_str = col_rate.text.strip().replace('%', '').replace('+', '')
-            try:
-                t_rate = float(t_rate_str)
-                top_themes.append((t_name, t_rate))
-            except ValueError:
-                pass
-    top_themes.sort(key=lambda x: x[1], reverse=True)
-    top_themes = top_themes[:10]
+    res = requests.get(url, headers=headers, timeout=5)
+    if res.status_code == 200:
+        data = res.json()
+        themes = data.get('themes', [])
+        for t in themes:
+            t_name = t.get('themeName', '').strip()
+            t_rate = float(str(t.get('fluctuationRate', '0')).replace('%', '').replace('+', ''))
+            top_themes.append((t_name, t_rate))
+    log(f"[*] 당일 주도 테마 {len(top_themes)}개 수집 완료")
 except Exception as e:
     log(f"[!] 주도 테마 수집 실패: {e}")
 
@@ -175,7 +170,6 @@ def analyze_stock(code):
         if today_vol < 200_000:
             return None
 
-        # 키움 주봉 변환 (W-FRI)
         df_w = df_d.resample('W-FRI').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
@@ -183,7 +177,6 @@ def analyze_stock(code):
         if len(df_w) < 35:
             return None
 
-        # 주봉 5주선 및 30주선
         df_w['SMA5'] = df_w['Close'].rolling(5).mean()
         df_w['SMA30'] = df_w['Close'].rolling(30).mean()
 
@@ -191,7 +184,7 @@ def analyze_stock(code):
         prev_close = int(df_d['Close'].iloc[-2])
         latest_date = df_d.index[-1]
 
-        # 1. 30주선 5주 연속 우상향 검증
+        # 30주선 5주 연속 우상향 검증
         sma30_series = df_w['SMA30'].dropna()
         if len(sma30_series) < 6:
             return None
@@ -202,16 +195,16 @@ def analyze_stock(code):
 
         sma30 = sma30_series.iloc[-1]
 
-        # 2. 30주선 이격도 (-2% ~ +10%)
+        # 30주선 이격도 (-2% ~ +10%)
         disp = (current_price / sma30) * 100.0
         if not (98.0 <= disp <= 110.0):
             return None
 
-        # 3. 주봉 5주선 지지 판정
+        # 주봉 5주선 지지 여부
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
 
-        # 4. 50일 거래량 이평 하회
+        # 거래량 50일 이평 하회
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
         vol_ratio_sma50 = (today_vol / vol_sma50 * 100.0) if vol_sma50 > 0 else 100.0
         vol_50_under = (today_vol < vol_sma50)
@@ -219,7 +212,7 @@ def analyze_stock(code):
         vol_1 = float(df_d['Volume'].iloc[-2])
         vol_ratio_prev = (today_vol / vol_1 * 100.0) if vol_1 > 0 else 100.0
 
-        # 5. VCP 수축 분석
+        # VCP 수축 분석
         recent_20 = df_d.iloc[-20:]
         recent_10 = df_d.iloc[-10:]
         recent_5 = df_d.iloc[-5:]
@@ -250,7 +243,7 @@ def analyze_stock(code):
             pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 4
 
-        # 6. 장기(250일) + 단기(60일) 듀얼 Mansfield RS
+        # 장·단기 듀얼 RS 계산
         df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
         if len(df_rs) >= 120:
             rs_line = df_rs['stock'] / df_rs['kospi']
@@ -329,9 +322,11 @@ with ThreadPoolExecutor(max_workers=15) as executor:
 
 log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
 
+# 메시지 조립
 msg = f"📊 [{today_str} 와인스타인 원전 100점 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
+# 당일 네이버 시장 주도 테마 TOP 10 상단 브리핑
 if top_themes:
     msg += "🔥 [당일 네이버 시장 주도 테마 TOP 10]\n"
     msg += "━━━━━━━━━━━━━━━━━━━━\n"
@@ -402,4 +397,4 @@ else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
 send_telegram(msg)
-log("[*] 와인스타인 원전 배점 리포트 발송 완료")
+log("[*] 리포트 발송 완료")
