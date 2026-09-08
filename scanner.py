@@ -4,8 +4,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import FinanceDataReader as fdr
 from bs4 import BeautifulSoup
+import io
 
 def log(text):
     print(text, flush=True)
@@ -72,19 +72,86 @@ try:
 except Exception as e:
     log(f"[!] 테마 수집 실패: {e}")
 
+# ============================================================
+# 2. 해외 IP 차단 및 404 원천 해결 시세/종목 데이터 파이프라인
+# ============================================================
+# 네이버 차트 API 기반 일봉 수집 함수 (FDR/KRX 404 차단 없음)
+def get_daily_candle(code, count=400):
+    url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count={count}&requestType=0"
+    try:
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        if r.status_code != 200:
+            return None
+        lines = r.text.split('\n')
+        rows = []
+        for l in lines:
+            if 'item data=' in l:
+                val = l.split('"')[1].split('|')
+                rows.append({
+                    'Date': pd.to_datetime(val[0]),
+                    'Open': float(val[1]),
+                    'High': float(val[2]),
+                    'Low': float(val[3]),
+                    'Close': float(val[4]),
+                    'Volume': float(val[5])
+                })
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        df.set_index('Date', inplace=True)
+        return df
+    except Exception:
+        return None
+
+# 코스피 지수 데이터 수집 (코스피 지수 티커: KOSPI)
 try:
-    df_kospi = fdr.DataReader('KS11', start_str)
-    kospi_close = df_kospi['Close']
+    df_kospi = get_daily_candle("KOSPI", count=400)
+    kospi_close = df_kospi['Close'] if df_kospi is not None else None
 except Exception:
     kospi_close = None
 
-df_krx = fdr.StockListing('KRX')
-if 'Marcap' in df_krx.columns:
-    df_krx = df_krx[df_krx['Marcap'] >= 1000_0000_0000]
+# KRX 404 대체: 네이버 증권 시가총액 상위 목록 직접 수집 (시총 1,000억 이상 유의미 종목 타겟)
+code_to_name = {}
+target_tickers_list = []
 
-target_tickers = list(df_krx['Code'])
-must_have = ["005090", "065060", "094480", "327260", "010170", "028050", "319660", "080220", "005930", "000660", "402340", "064290"]
-target_tickers = list(set(target_tickers + must_have))
+try:
+    log("[*] 네이버 금융 시가총액 상위 종목 수집 중 (KRX 404 완벽 우회)...")
+    for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
+        for page in range(1, 16):  # 상위 약 750개 종목 스캔
+            p_url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+            res = requests.get(p_url, headers=headers, timeout=6)
+            soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
+            table = soup.find('table', class_='type_2')
+            if not table:
+                continue
+            
+            for tr in table.find_all('tr'):
+                td_name = tr.find('td', class_='title')
+                if td_name:
+                    a = td_name.find('a')
+                    if a and 'code=' in a.get('href', ''):
+                        cd = a['href'].split('code=')[1].strip()
+                        nm = a.text.strip()
+                        if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
+                            continue
+                        code_to_name[cd] = nm
+                        target_tickers_list.append(cd)
+except Exception as e:
+    log(f"[!] 종목 리스트 수집 경고: {e}")
+
+must_have = [
+    ("005090", "SGC에너지"), ("065060", "지엔씨에너지"), ("094480", "갤러리아타임월드"),
+    ("327260", "RF머트리얼즈"), ("010170", "대한광통신"), ("028050", "삼성E&A"),
+    ("319660", "피에스케이"), ("080220", "제주반도체"), ("005930", "삼성전자"),
+    ("000660", "SK하이닉스"), ("402340", "SK스퀘어"), ("064290", "인텍플러스"),
+    ("403870", "HPSP"), ("093370", "후성"), ("375500", "DL이앤씨"), ("010120", "LS ELECTRIC")
+]
+
+for cd, nm in must_have:
+    code_to_name[cd] = nm
+    target_tickers_list.append(cd)
+
+target_tickers = list(set(target_tickers_list))
 
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
@@ -151,13 +218,12 @@ def get_investor_trend(code, latest_df_date):
         inst_5d = sum(int(str(it.get('institutionPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
         frgn_5d = sum(int(str(it.get('foreignerPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
         
-        # 개인 순매수 데이터 산출 (제공 필드 파싱 또는 제로섬 역산)
+        # 개인 순매수 데이터 산출
         indiv_list = []
         for it in slice_5d:
             if 'individualPureBuyQuant' in it:
                 indiv_list.append(int(str(it.get('individualPureBuyQuant', '0')).replace(',', '')))
             else:
-                # 필드가 없을 경우 (개인 = -(외인 + 기관)) 역산
                 f_q = int(str(it.get('foreignerPureBuyQuant', '0')).replace(',', ''))
                 i_q = int(str(it.get('institutionPureBuyQuant', '0')).replace(',', ''))
                 indiv_list.append(-(f_q + i_q))
@@ -165,7 +231,7 @@ def get_investor_trend(code, latest_df_date):
         indiv_5d = sum(indiv_list)
         smart_money_5d = frgn_5d + inst_5d
 
-        # 팩트 판정 로직
+        # 판정 로직
         if indiv_5d < 0 and smart_money_5d > 0:
             tag = f"💎 [스마트머니 장악] 개인 5일 누적 매도({indiv_5d:,}주) | 외인·기관 흡수(+{smart_money_5d:,}주)"
             score = 10
@@ -188,12 +254,12 @@ def get_investor_trend(code, latest_df_date):
 
 def analyze_stock(code):
     try:
-        df_d = fdr.DataReader(code, start_str)
-        if len(df_d) < 180 or kospi_close is None:
+        df_d = get_daily_candle(code, count=360)
+        if df_d is None or len(df_d) < 180 or kospi_close is None:
             return None
 
         today_vol = float(df_d['Volume'].iloc[-1])
-        if today_vol < 200_000:
+        if today_vol < 150_000:  # 거래량 필터
             return None
 
         df_w = df_d.resample('W-FRI').agg({
@@ -311,8 +377,7 @@ def analyze_stock(code):
         if vol_50_under: chg_parts.append("📉50일거래하회")
         chg_str = " ".join(chg_parts)
 
-        name_match = df_krx[df_krx['Code'] == code]
-        name = name_match['Name'].iloc[0] if not name_match.empty else code
+        name = code_to_name.get(code, code)
         name = name.replace("[", "").replace("]", "").replace("*", "")
 
         if 99.0 <= disp <= 103.0:
@@ -352,7 +417,7 @@ def analyze_stock(code):
 results = []
 log(f"[*] 총 {len(target_tickers)}개 종목 분석 중...")
 
-with ThreadPoolExecutor(max_workers=15) as executor:
+with ThreadPoolExecutor(max_workers=10) as executor:
     future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
     for future in as_completed(future_to_code):
         res = future.result()
@@ -423,7 +488,7 @@ if results:
         msg += f"   - 수급: {r['investor']}\n"
         msg += f"   - 상대강도: {r['rs']}\n"
         msg += f"   - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 주봉5주선: {r['sma5_w']:,}원\n"
-        msg += f"   - 50일거래비: {r['vol_ratio_sma50']}% [{bar}] | 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n"
+        msg += f"   - 50일거래비: {r['vol_ratio_sma50']}% [{bar}] | 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n\n"
 else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
 
