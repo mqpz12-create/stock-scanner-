@@ -34,19 +34,17 @@ def send_telegram(message):
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-start_str = (datetime.today() - timedelta(days=550)).strftime("%Y-%m-%d")
+log(f"[*] {today_str} 전종목 1,500개+ 확장 스캐너 구동...")
 
-log(f"[*] {today_str} 개인 5일 누적 순매도 필터 기반 VCP 스캐너 구동...")
-
-# ============================================================
-# 1. 네이버 당일 주도 테마 TOP 10 수집
-# ============================================================
-top_themes = []
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Referer': 'https://finance.naver.com/'
 }
 
+# ============================================================
+# 1. 네이버 당일 주도 테마 TOP 10 수집
+# ============================================================
+top_themes = []
 try:
     url = "https://finance.naver.com/sise/theme.naver?&page=1"
     res = requests.get(url, headers=headers, timeout=6)
@@ -73,9 +71,8 @@ except Exception as e:
     log(f"[!] 테마 수집 실패: {e}")
 
 # ============================================================
-# 2. 해외 IP 차단 및 404 원천 해결 시세/종목 데이터 파이프라인
+# 2. 캔들 수집 파이프라인
 # ============================================================
-# 네이버 차트 API 기반 일봉 수집 함수 (FDR/KRX 404 차단 없음)
 def get_daily_candle(code, count=400):
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count={count}&requestType=0"
     try:
@@ -103,56 +100,71 @@ def get_daily_candle(code, count=400):
     except Exception:
         return None
 
-# 코스피 지수 데이터 수집 (코스피 지수 티커: KOSPI)
 try:
     df_kospi = get_daily_candle("KOSPI", count=400)
     kospi_close = df_kospi['Close'] if df_kospi is not None else None
 except Exception:
     kospi_close = None
 
-# KRX 404 대체: 네이버 증권 시가총액 상위 목록 직접 수집 (시총 1,000억 이상 유의미 종목 타겟)
+# ============================================================
+# 3. 1,500개 이상 전종목 고속 병렬 수집 (페이지 1~35장 스캔)
+# ============================================================
 code_to_name = {}
-target_tickers_list = []
 
-try:
-    log("[*] 네이버 금융 시가총액 상위 종목 수집 중 (KRX 404 완벽 우회)...")
-    for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
-        for page in range(1, 16):  # 상위 약 750개 종목 스캔
-            p_url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
-            res = requests.get(p_url, headers=headers, timeout=6)
+def fetch_market_page(sosok, page):
+    page_items = []
+    p_url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
+    try:
+        res = requests.get(p_url, headers=headers, timeout=5)
+        if res.status_code == 200:
             soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
             table = soup.find('table', class_='type_2')
-            if not table:
-                continue
-            
-            for tr in table.find_all('tr'):
-                td_name = tr.find('td', class_='title')
-                if td_name:
-                    a = td_name.find('a')
-                    if a and 'code=' in a.get('href', ''):
-                        cd = a['href'].split('code=')[1].strip()
-                        nm = a.text.strip()
-                        if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
-                            continue
-                        code_to_name[cd] = nm
-                        target_tickers_list.append(cd)
-except Exception as e:
-    log(f"[!] 종목 리스트 수집 경고: {e}")
+            if table:
+                for tr in table.find_all('tr'):
+                    td_name = tr.find('td', class_='title')
+                    if td_name:
+                        a = td_name.find('a')
+                        if a and 'code=' in a.get('href', ''):
+                            cd = a['href'].split('code=')[1].strip()
+                            nm = a.text.strip()
+                            # 잡주/우선주/스팩 필터링
+                            if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
+                                continue
+                            page_items.append((cd, nm))
+    except Exception:
+        pass
+    return page_items
 
+log("[*] 코스피/코스닥 전종목 (1,500개+) 고속 병렬 수집 중...")
+tasks = []
+with ThreadPoolExecutor(max_workers=10) as page_exec:
+    for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
+        for page in range(1, 36):  # 각각 상위 35페이지 (총 약 3,500개 커버)
+            tasks.append(page_exec.submit(fetch_market_page, sosok, page))
+    
+    for f in as_completed(tasks):
+        for cd, nm in f.result():
+            code_to_name[cd] = nm
+
+# 필수 감시 종목 리스트 (SK이터닉스 475150 추가)
 must_have = [
-    ("005090", "SGC에너지"), ("065060", "지엔씨에너지"), ("094480", "갤러리아타임월드"),
-    ("327260", "RF머트리얼즈"), ("010170", "대한광통신"), ("028050", "삼성E&A"),
-    ("319660", "피에스케이"), ("080220", "제주반도체"), ("005930", "삼성전자"),
-    ("000660", "SK하이닉스"), ("402340", "SK스퀘어"), ("064290", "인텍플러스"),
-    ("403870", "HPSP"), ("093370", "후성"), ("375500", "DL이앤씨"), ("010120", "LS ELECTRIC")
+    ("475150", "SK이터닉스"), ("005090", "SGC에너지"), ("065060", "지엔씨에너지"),
+    ("094480", "갤러리아타임월드"), ("327260", "RF머트리얼즈"), ("010170", "대한광통신"),
+    ("028050", "삼성E&A"), ("319660", "피에스케이"), ("080220", "제주반도체"),
+    ("005930", "삼성전자"), ("000660", "SK하이닉스"), ("402340", "SK스퀘어"),
+    ("064290", "인텍플러스"), ("403870", "HPSP"), ("093370", "후성"),
+    ("375500", "DL이앤씨"), ("010120", "LS ELECTRIC")
 ]
 
 for cd, nm in must_have:
     code_to_name[cd] = nm
-    target_tickers_list.append(cd)
 
-target_tickers = list(set(target_tickers_list))
+target_tickers = list(code_to_name.keys())
+log(f"[*] 최종 스캔 대상 종목수: {len(target_tickers)}개 확보 완료")
 
+# ============================================================
+# 4. 분석 보조 함수 및 알고리즘
+# ============================================================
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
@@ -162,40 +174,27 @@ def get_streak_info(df_d):
         closes = df_d['Close'].values
         if len(closes) < 5:
             return ""
-        
         diffs = [closes[i] - closes[i-1] for i in range(1, len(closes))]
         last_diff = diffs[-1]
         prev_diff = diffs[-2]
         
-        if last_diff > 0 and prev_diff <= 0:
-            return "⚡️첫 상승전환"
-        elif last_diff < 0 and prev_diff >= 0:
-            return "💧첫 하락전환"
+        if last_diff > 0 and prev_diff <= 0: return "⚡️첫 상승전환"
+        elif last_diff < 0 and prev_diff >= 0: return "💧첫 하락전환"
         elif last_diff > 0:
-            streak = 0
-            for d in reversed(diffs):
-                if d > 0: streak += 1
-                else: break
+            streak = sum(1 for _ in filter(lambda x: x > 0, reversed(diffs)))
             return f"🔥{streak}일연속상승"
         elif last_diff < 0:
-            streak = 0
-            for d in reversed(diffs):
-                if d < 0: streak += 1
-                else: break
+            streak = sum(1 for _ in filter(lambda x: x < 0, reversed(diffs)))
             return f"❄️{streak}일연속하락"
-        else:
-            return "➖보합"
+        else: return "➖보합"
     except Exception:
         return ""
 
 def get_investor_trend(code, latest_df_date):
-    """
-    개인 5일 누적 순매도 기반 스마트머니 물량 장악도 판정
-    """
     try:
         url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10&page=1"
         h = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
-        res = requests.get(url, headers=h, timeout=2.5)
+        res = requests.get(url, headers=h, timeout=2.0)
         if res.status_code != 200:
             return "⚪️ 수급 확인불가", 0
             
@@ -213,12 +212,9 @@ def get_investor_trend(code, latest_df_date):
                 break
 
         slice_5d = trends[target_idx:target_idx+5]
-        
-        # 5일 누적 수량 계산
         inst_5d = sum(int(str(it.get('institutionPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
         frgn_5d = sum(int(str(it.get('foreignerPureBuyQuant', '0')).replace(',', '')) for it in slice_5d)
         
-        # 개인 순매수 데이터 산출
         indiv_list = []
         for it in slice_5d:
             if 'individualPureBuyQuant' in it:
@@ -231,7 +227,6 @@ def get_investor_trend(code, latest_df_date):
         indiv_5d = sum(indiv_list)
         smart_money_5d = frgn_5d + inst_5d
 
-        # 판정 로직
         if indiv_5d < 0 and smart_money_5d > 0:
             tag = f"💎 [스마트머니 장악] 개인 5일 누적 매도({indiv_5d:,}주) | 외인·기관 흡수(+{smart_money_5d:,}주)"
             score = 10
@@ -259,7 +254,7 @@ def analyze_stock(code):
             return None
 
         today_vol = float(df_d['Volume'].iloc[-1])
-        if today_vol < 150_000:  # 거래량 필터
+        if today_vol < 100_000:  # 중소형주 수렴 고려 기준치 소폭 완화 (15만 -> 10만)
             return None
 
         df_w = df_d.resample('W-FRI').agg({
@@ -280,19 +275,23 @@ def analyze_stock(code):
         if len(sma30_series) < 8:
             return None
 
-        # 와인스타인 원전: 최근 3주 및 5주 대비 우상향 유지
+        # 와인스타인: 30주선 우상향 확인
         is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3]) and (sma30_series.iloc[-1] > sma30_series.iloc[-6])
         if not is_sma30_uptrend:
             return None
 
         sma30 = sma30_series.iloc[-1]
 
+        # 30주선 이격도 필터 (상한선 110% -> 112%로 완화하여 돌파 직전 강한 주도주 누락 방지)
         disp = (current_price / sma30) * 100.0
-        if not (98.0 <= disp <= 110.0):
+        if not (98.0 <= disp <= 112.0):
             return None
 
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
+        
+        # 5주선 돌파 임박 (턱밑 2.5% 이내) 여부
+        is_near_w5 = (not is_above_w5) and (current_price >= sma5_val * 0.975)
 
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
         vol_ratio_sma50 = (today_vol / vol_sma50 * 100.0) if vol_sma50 > 0 else 100.0
@@ -343,6 +342,9 @@ def analyze_stock(code):
         elif is_above_w5:
             buy_trigger_str = f"⏳ 베이스 수축 진행 (피벗 {pivot_high:,}원 | 이격 +{dist_to_pivot:.1f}%)"
             trigger_score = 5
+        elif is_near_w5:
+            buy_trigger_str = f"⚡️ 5주선 돌파 임박 (머리 위 5주선: {int(round(sma5_val)):,}원 | 이격 {((sma5_val-current_price)/current_price*100):.1f}%)"
+            trigger_score = 4  # 돌파 임박 가산점 신설
         else:
             buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
             trigger_score = 0
@@ -395,6 +397,7 @@ def analyze_stock(code):
             "sma30": int(round(sma30)),
             "sma5_w": int(round(sma5_val)),
             "is_above_w5": is_above_w5,
+            "is_near_w5": is_near_w5,
             "disp": round(disp, 1),
             "vol_today": int(today_vol),
             "vol_ratio_prev": round(vol_ratio_prev, 1),
@@ -414,19 +417,25 @@ def analyze_stock(code):
     except Exception:
         return None
 
+# ============================================================
+# 5. 전종목 고속 분석 실행 (스레드 20개)
+# ============================================================
 results = []
-log(f"[*] 총 {len(target_tickers)}개 종목 분석 중...")
+log(f"[*] 총 {len(target_tickers)}개 종목 고속 정밀 스캔 시작...")
 
-with ThreadPoolExecutor(max_workers=10) as executor:
+with ThreadPoolExecutor(max_workers=20) as executor:
     future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
     for future in as_completed(future_to_code):
         res = future.result()
         if res:
             results.append(res)
 
-log(f"[*] 분석 완료. 포착 종목수: {len(results)}개")
+log(f"[*] 전종목 분석 완료! 최종 조건 통과 종목: {len(results)}개")
 
-msg = f"📊 [{today_str} 와인스타인 원전 100점 VCP 리포트]\n"
+# ============================================================
+# 6. 채점 및 텔레그램 리포트 생성
+# ============================================================
+msg = f"📊 [{today_str} 와인스타인 전종목(1,500+) 100점 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
 if top_themes:
@@ -447,8 +456,9 @@ if results:
         if r['m_rs_long'] > 0 and r['m_rs_short'] > 0: score += 25
         elif r['m_rs_long'] > 0: score += 12
 
-        # 2. 주봉 5주선 위 안착 (20점 만점)
+        # 2. 주봉 5주선 안착 여부 (20점 만점)
         if r['is_above_w5']: score += 20
+        elif r['is_near_w5']: score += 12  # 5주선 턱밑 임박 시 12점 부여
         else: score += 5
 
         # 3. 50일 거래량 마름 (20점 만점)
@@ -466,7 +476,7 @@ if results:
         elif 103.0 < r['disp'] <= 107.0: score += 7
         else: score += 4
 
-        # 7. 개인 5일 누적 순매도(스마트머니 장악도) 반영 (+10점 ~ -10점)
+        # 7. 개인 5일 누적 순매도 반영 (+10점 ~ -10점)
         score += r['investor_score']
 
         r_dict = dict(r)
@@ -476,11 +486,14 @@ if results:
     df_res = pd.DataFrame(final_results)
     df_sorted = df_res.sort_values(by=["score", "m_rs_long"], ascending=[False, False]).reset_index(drop=True)
 
-    msg += f"📋 [포착 종목 셋업 랭킹] (총 {len(df_sorted)}개)\n"
-    for idx, r in df_sorted.iterrows():
+    # 상위 최대 15개 종목 출력 (스크롤 압박 방지)
+    df_top = df_sorted.head(15)
+
+    msg += f"📋 [포착 종목 셋업 랭킹 TOP {len(df_top)}] (전체 {len(df_sorted)}개 중)\n"
+    for idx, r in df_top.iterrows():
         rank = idx + 1
         bar = make_vol_bar(r['vol_ratio_sma50'])
-        w5_mark = "🟢5주선위(상방열림)" if r['is_above_w5'] else "🟡5주선아래(매물저항)"
+        w5_mark = "🟢5주선위(상방열림)" if r['is_above_w5'] else ("⚡️5주선돌파임박" if r['is_near_w5'] else "🟡5주선아래(매물저항)")
         
         msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']} | {w5_mark}]\n"
         msg += f"   - 매수타점: {r['buy_trigger_str']}\n"
