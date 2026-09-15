@@ -127,7 +127,6 @@ def fetch_market_page(sosok, page):
                         if a and 'code=' in a.get('href', ''):
                             cd = a['href'].split('code=')[1].strip()
                             nm = a.text.strip()
-                            # 잡주/우선주/스팩 필터링
                             if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
                                 continue
                             page_items.append((cd, nm))
@@ -138,15 +137,14 @@ def fetch_market_page(sosok, page):
 log("[*] 코스피/코스닥 전종목 (1,500개+) 고속 병렬 수집 중...")
 tasks = []
 with ThreadPoolExecutor(max_workers=10) as page_exec:
-    for sosok in [0, 1]:  # 0: 코스피, 1: 코스닥
-        for page in range(1, 36):  # 각각 상위 35페이지 (총 약 3,500개 커버)
+    for sosok in [0, 1]:
+        for page in range(1, 36):
             tasks.append(page_exec.submit(fetch_market_page, sosok, page))
     
     for f in as_completed(tasks):
         for cd, nm in f.result():
             code_to_name[cd] = nm
 
-# 필수 감시 종목 리스트 (SK이터닉스 475150 추가)
 must_have = [
     ("475150", "SK이터닉스"), ("005090", "SGC에너지"), ("065060", "지엔씨에너지"),
     ("094480", "갤러리아타임월드"), ("327260", "RF머트리얼즈"), ("010170", "대한광통신"),
@@ -254,7 +252,10 @@ def analyze_stock(code):
             return None
 
         today_vol = float(df_d['Volume'].iloc[-1])
-        if today_vol < 100_000:  # 중소형주 수렴 고려 기준치 소폭 완화 (15만 -> 10만)
+        
+        # [최소 거래량 20만 주 이상 필터] 20만 주 미만인 종목은 즉시 탈락(Drop)
+        MIN_VOLUME_REQUIRED = 200_000
+        if today_vol < MIN_VOLUME_REQUIRED:
             return None
 
         df_w = df_d.resample('W-FRI').agg({
@@ -282,15 +283,13 @@ def analyze_stock(code):
 
         sma30 = sma30_series.iloc[-1]
 
-        # 30주선 이격도 필터 (상한선 110% -> 112%로 완화하여 돌파 직전 강한 주도주 누락 방지)
+        # 30주선 이격도 필터 (98.0% ~ 112.0% 엄격 유지)
         disp = (current_price / sma30) * 100.0
         if not (98.0 <= disp <= 112.0):
             return None
 
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
-        
-        # 5주선 돌파 임박 (턱밑 2.5% 이내) 여부
         is_near_w5 = (not is_above_w5) and (current_price >= sma5_val * 0.975)
 
         vol_sma50 = df_d['Volume'].rolling(50).mean().iloc[-1]
@@ -344,7 +343,7 @@ def analyze_stock(code):
             trigger_score = 5
         elif is_near_w5:
             buy_trigger_str = f"⚡️ 5주선 돌파 임박 (머리 위 5주선: {int(round(sma5_val)):,}원 | 이격 {((sma5_val-current_price)/current_price*100):.1f}%)"
-            trigger_score = 4  # 돌파 임박 가산점 신설
+            trigger_score = 4
         else:
             buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
             trigger_score = 0
@@ -458,7 +457,7 @@ if results:
 
         # 2. 주봉 5주선 안착 여부 (20점 만점)
         if r['is_above_w5']: score += 20
-        elif r['is_near_w5']: score += 12  # 5주선 턱밑 임박 시 12점 부여
+        elif r['is_near_w5']: score += 12
         else: score += 5
 
         # 3. 50일 거래량 마름 (20점 만점)
@@ -486,7 +485,6 @@ if results:
     df_res = pd.DataFrame(final_results)
     df_sorted = df_res.sort_values(by=["score", "m_rs_long"], ascending=[False, False]).reset_index(drop=True)
 
-    # 상위 최대 15개 종목 출력 (스크롤 압박 방지)
     df_top = df_sorted.head(15)
 
     msg += f"📋 [포착 종목 셋업 랭킹 TOP {len(df_top)}] (전체 {len(df_sorted)}개 중)\n"
