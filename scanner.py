@@ -35,16 +35,19 @@ def send_telegram(message):
 today_str = datetime.today().strftime("%Y-%m-%d")
 log(f"[*] {today_str} 전종목 1,500개+ 확장 스캐너 구동...")
 
+session = requests.Session()
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
     'Referer': 'https://finance.naver.com/'
 }
+session.headers.update(headers)
 
 # 1. 네이버 당일 주도 테마 TOP 10 수집
 top_themes = []
 try:
     url = "https://finance.naver.com/sise/theme.naver?&page=1"
-    res = requests.get(url, headers=headers, timeout=6)
+    res = session.get(url, timeout=8)
     if res.status_code == 200:
         soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
         rows = soup.find_all('tr')
@@ -72,7 +75,7 @@ def get_daily_candle(code, count=400):
     code_str = str(code).strip().zfill(6)
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code_str}&timeframe=day&count={count}&requestType=0"
     try:
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=6)
+        r = session.get(url, timeout=6)
         if r.status_code != 200:
             return None
         lines = r.text.split('\n')
@@ -96,21 +99,20 @@ def get_daily_candle(code, count=400):
     except Exception:
         return None
 
-# 코스피 지수 벤치마크로 KODEX 200(069500) 사용 (호출 실패 방지)
 try:
     df_kospi = get_daily_candle("069500", count=400)
     kospi_close = df_kospi['Close'] if df_kospi is not None else None
 except Exception:
     kospi_close = None
 
-# 3. 전종목 코드 수집
+# 3. 전종목 코드 수집부 (GitHub Actions 차단 방지 세션 및 안전 파싱)
 code_to_name = {}
 
 def fetch_market_page(sosok, page):
     page_items = []
     p_url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
     try:
-        res = requests.get(p_url, headers=headers, timeout=6)
+        res = session.get(p_url, timeout=8)
         if res.status_code == 200:
             soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
             table = soup.find('table', class_='type_2')
@@ -125,19 +127,20 @@ def fetch_market_page(sosok, page):
                             if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
                                 continue
                             page_items.append((cd, nm))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"[!] sosok={sosok} page={page} 에러: {e}")
     return page_items
 
 log("[*] 코스피/코스닥 전종목 고속 병렬 수집 중...")
 tasks = []
-with ThreadPoolExecutor(max_workers=8) as page_exec:
+with ThreadPoolExecutor(max_workers=5) as page_exec:
     for sosok in [0, 1]:
         for page in range(1, 36):
             tasks.append(page_exec.submit(fetch_market_page, sosok, page))
     
     for f in as_completed(tasks):
-        for cd, nm in f.result():
+        res_items = f.result()
+        for cd, nm in res_items:
             code_to_name[cd] = nm
 
 target_tickers = list(code_to_name.keys())
@@ -173,8 +176,7 @@ def get_investor_trend(code, latest_df_date):
     try:
         code_str = str(code).strip().zfill(6)
         url = f"https://m.stock.naver.com/api/stock/{code_str}/trend?pageSize=10&page=1"
-        h = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
-        res = requests.get(url, headers=h, timeout=3.0)
+        res = session.get(url, timeout=3.0)
         if res.status_code != 200:
             return "⚪️ 수급 확인불가", 0
             
@@ -231,7 +233,6 @@ def analyze_stock(code):
     try:
         code = str(code).strip().zfill(6)
         df_d = get_daily_candle(code, count=360)
-        # kospi_close 가드 제거 (개별 종목 데이터만 유효하면 분석 진행)
         if df_d is None or len(df_d) < 180:
             return None
 
@@ -326,7 +327,6 @@ def analyze_stock(code):
             buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
             trigger_score = 0
 
-        # RS 계산 시 kospi_close 존재 여부 안전 체크
         m_rs_long, m_rs_short = 0.0, 0.0
         if kospi_close is not None:
             df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
@@ -399,7 +399,7 @@ def analyze_stock(code):
 results = []
 log(f"[*] 총 {len(target_tickers)}개 종목 고속 정밀 스캔 시작...")
 
-with ThreadPoolExecutor(max_workers=15) as executor:
+with ThreadPoolExecutor(max_workers=10) as executor:
     future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
     for future in as_completed(future_to_code):
         res = future.result()
