@@ -17,10 +17,11 @@ def send_telegram(message):
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     
-    max_len = 3500
+    # 텔레그램 메시지 길이 제한(4,096자) 대응: 3,000자 단위 안전 분할
+    max_len = 3000
     msg_chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
     
-    for chunk in msg_chunks:
+    for idx, chunk in enumerate(msg_chunks):
         payload = {
             "chat_id": chat_id, 
             "text": chunk, 
@@ -28,12 +29,12 @@ def send_telegram(message):
         }
         try:
             res = requests.post(url, json=payload, timeout=10)
-            log(f"[*] 텔레그램 응답 코드: {res.status_code}")
+            log(f"[*] 텔레그램 [{idx+1}/{len(msg_chunks)}] 응답 코드: {res.status_code}")
         except Exception as e:
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-log(f"[*] {today_str} 순수 개별주 VCP 스캐너 가동...")
+log(f"[*] {today_str} 순수 개별주 TOP 30 VCP 스캐너 가동...")
 
 session = requests.Session()
 session.headers.update({
@@ -41,7 +42,9 @@ session.headers.update({
     'Referer': 'https://m.stock.naver.com/'
 })
 
+# ============================================================
 # 1. 네이버 당일 주도 테마 TOP 10 수집
+# ============================================================
 top_themes = []
 try:
     url = "https://finance.naver.com/sise/theme.naver?&page=1"
@@ -67,19 +70,23 @@ try:
 except Exception as e:
     log(f"[!] 테마 수집 실패: {e}")
 
-# 2. 전종목 리스트 API 고속 확보 (ETF 브랜드 전수 제외)
+# ============================================================
+# 2. 전종목 리스트 API 고속 확보 (ETF/ETN/인덱스 전수 차단)
+# ============================================================
 code_to_name = {}
 
-# ETF/ETN/펀드/스팩/리츠 키워드 블록리스트
+# 국내 모든 ETF 운용사 브랜드 및 파생/지수 키워드 전수 차단
 EXCLUDE_KEYWORDS = [
-    'KODEX', 'TIGER', 'ACE', 'KBSTAR', 'SOL', 'PLUS', 'HANARO', 'KOSEF', 
-    'TIMEFOLIO', '히어로즈', 'WOORI', '하나로', 'ARIRANG', 'FOCUS', 'TRUSTON',
-    'ETF', 'ETN', '인버스', '레버리지', '선물', '스팩', '리츠', '채권', 'TR'
+    'KODEX', 'TIGER', 'ACE', 'KBSTAR', 'RISE', 'SOL', 'PLUS', 'HANARO', 
+    'KOSEF', 'KIWOOM', 'TIMEFOLIO', '히어로즈', 'WOORI', 'WON', '하나로', 
+    'ARIRANG', 'FOCUS', 'TRUSTON', 'UNIONE', 'ETF', 'ETN', '인버스', 
+    '레버리지', '선물', '스팩', '리츠', '채권', 'TR', '200', '코스피', '코스닥'
 ]
 
 def get_market_tickers(market_type):
     items = []
-    for page in range(1, 25):
+    # 코스피/코스닥 각 25페이지 (총 약 3,000개 수집 후 필터링)
+    for page in range(1, 26):
         api_url = f"https://m.stock.naver.com/api/stocks/marketValue/{market_type}?page={page}&pageSize=60"
         try:
             r = session.get(api_url, timeout=4)
@@ -95,7 +102,7 @@ def get_market_tickers(market_type):
                 if not cd or not nm:
                     continue
                 
-                # ETF, 우선주, 스팩 완전 제외
+                # ETF 브랜드, 우선주, 스팩 철저 배제
                 if any(k in nm for k in EXCLUDE_KEYWORDS) or nm.endswith('우') or nm.endswith('우B') or nm.endswith('3우C'):
                     continue
                 items.append((cd, nm))
@@ -103,7 +110,7 @@ def get_market_tickers(market_type):
             break
     return items
 
-log("[*] 코스피/코스닥 순수 개별주 JSON 취득 중...")
+log("[*] 코스피/코스닥 순수 개별주 취득 중...")
 with ThreadPoolExecutor(max_workers=2) as exec_ticker:
     f_kospi = exec_ticker.submit(get_market_tickers, "KOSPI")
     f_kosdaq = exec_ticker.submit(get_market_tickers, "KOSDAQ")
@@ -112,9 +119,11 @@ with ThreadPoolExecutor(max_workers=2) as exec_ticker:
         code_to_name[cd] = nm
 
 target_tickers = list(code_to_name.keys())
-log(f"[*] 유효 스캔 대상 개별 보통주: {len(target_tickers)}개 확보 완료")
+log(f"[*] 유효 스캔 대상 순수 상장 보통주: {len(target_tickers)}개 확보 완료")
 
+# ============================================================
 # 3. 캔들 수집 파이프라인
+# ============================================================
 def get_daily_candle(code, count=400):
     code_str = str(code).strip().zfill(6)
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code_str}&timeframe=day&count={count}&requestType=0"
@@ -149,7 +158,9 @@ try:
 except Exception:
     kospi_close = None
 
+# ============================================================
 # 4. 분석 보조 함수
+# ============================================================
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
@@ -261,6 +272,7 @@ def analyze_stock(code):
         if len(sma30_series) < 8:
             return None
 
+        # 와인스타인: 30주선 우상향/바닥 다지기
         is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3] * 0.998)
         if not is_sma30_uptrend:
             return None
@@ -398,7 +410,9 @@ def analyze_stock(code):
     except Exception:
         return None
 
+# ============================================================
 # 5. 전종목 병렬 고속 스캔 실행
+# ============================================================
 results = []
 log(f"[*] 총 {len(target_tickers)}개 순수 상장주 정밀 스캔 시작...")
 
@@ -411,7 +425,9 @@ with ThreadPoolExecutor(max_workers=25) as executor:
 
 log(f"[*] 전종목 분석 완료! 최종 조건 통과 종목: {len(results)}개")
 
-# 6. 채점 및 텔레그램 리포트 생성
+# ============================================================
+# 6. 채점 및 텔레그램 리포트 생성 (상위 30개 확장 출력)
+# ============================================================
 msg = f"📊 [{today_str} 와인스타인 순수 개별주 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
@@ -453,7 +469,9 @@ if results:
 
     df_res = pd.DataFrame(final_results)
     df_sorted = df_res.sort_values(by=["score", "m_rs_long"], ascending=[False, False]).reset_index(drop=True)
-    df_top = df_sorted.head(15)
+    
+    # 상위 30개 출력 적용
+    df_top = df_sorted.head(30)
 
     msg += f"📋 [포착 종목 셋업 랭킹 TOP {len(df_top)}] (전체 {len(df_sorted)}개 중)\n"
     for idx, r in df_top.iterrows():
