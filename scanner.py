@@ -33,21 +33,21 @@ def send_telegram(message):
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-log(f"[*] {today_str} 전종목 1,500개+ 확장 스캐너 구동...")
+log(f"[*] {today_str} 전종목 2,000개+ 차단프리 초고속 스캐너 가동...")
 
 session = requests.Session()
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-    'Referer': 'https://finance.naver.com/'
-}
-session.headers.update(headers)
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148',
+    'Referer': 'https://m.stock.naver.com/'
+})
 
+# ============================================================
 # 1. 네이버 당일 주도 테마 TOP 10 수집
+# ============================================================
 top_themes = []
 try:
     url = "https://finance.naver.com/sise/theme.naver?&page=1"
-    res = session.get(url, timeout=8)
+    res = session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=6)
     if res.status_code == 200:
         soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
         rows = soup.find_all('tr')
@@ -61,8 +61,7 @@ try:
                     t_name = a_tag.text.strip()
                     t_rate_str = span_tag.text.strip().replace('%', '').replace('+', '').replace(',', '')
                     try:
-                        t_rate = float(t_rate_str)
-                        top_themes.append((t_name, t_rate))
+                        top_themes.append((t_name, float(t_rate_str)))
                     except ValueError:
                         pass
         top_themes.sort(key=lambda x: x[1], reverse=True)
@@ -70,12 +69,57 @@ try:
 except Exception as e:
     log(f"[!] 테마 수집 실패: {e}")
 
-# 2. 캔들 수집 파이프라인
+# ============================================================
+# 2. 전종목 리스트 API 고속 확보 (HTML 크롤링 완전 대체)
+# ============================================================
+code_to_name = {}
+
+def get_market_tickers(market_type):
+    # m.stock.naver.com의 공식 시총 JSON API 사용 (해외 IP 차단 절대 없음)
+    items = []
+    page = 1
+    while page <= 40:
+        api_url = f"https://m.stock.naver.com/api/stocks/marketValue/{market_type}?page={page}&pageSize=60"
+        try:
+            r = session.get(api_url, timeout=5)
+            if r.status_code != 200:
+                break
+            data = r.json()
+            stocks = data.get('stocks', [])
+            if not stocks:
+                break
+            for s in stocks:
+                cd = str(s.get('itemCode', '')).strip().zfill(6)
+                nm = str(s.get('stockName', '')).strip()
+                if not cd or not nm:
+                    continue
+                if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
+                    continue
+                items.append((cd, nm))
+            page += 1
+        except Exception:
+            break
+    return items
+
+log("[*] 코스피/코스닥 전종목 JSON API 고속 취득 중...")
+with ThreadPoolExecutor(max_workers=2) as exec_ticker:
+    f_kospi = exec_ticker.submit(get_market_tickers, "KOSPI")
+    f_kosdaq = exec_ticker.submit(get_market_tickers, "KOSDAQ")
+    
+    for cd, nm in f_kospi.result() + f_kosdaq.result():
+        code_to_name[cd] = nm
+
+target_tickers = list(code_to_name.keys())
+log(f"[*] 유효 스캔 대상 종목수: {len(target_tickers)}개 확보 완료")
+
+# ============================================================
+# 3. 캔들 파이프라인
+# ============================================================
 def get_daily_candle(code, count=400):
     code_str = str(code).strip().zfill(6)
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code_str}&timeframe=day&count={count}&requestType=0"
     try:
-        r = session.get(url, timeout=6)
+        r = session.get(url, timeout=5)
         if r.status_code != 200:
             return None
         lines = r.text.split('\n')
@@ -99,54 +143,16 @@ def get_daily_candle(code, count=400):
     except Exception:
         return None
 
+# 코스피 벤치마크 KODEX 200(069500)
 try:
     df_kospi = get_daily_candle("069500", count=400)
     kospi_close = df_kospi['Close'] if df_kospi is not None else None
 except Exception:
     kospi_close = None
 
-# 3. 전종목 코드 수집부 (GitHub Actions 차단 방지 세션 및 안전 파싱)
-code_to_name = {}
-
-def fetch_market_page(sosok, page):
-    page_items = []
-    p_url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
-    try:
-        res = session.get(p_url, timeout=8)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
-            table = soup.find('table', class_='type_2')
-            if table:
-                for tr in table.find_all('tr'):
-                    td_name = tr.find('td', class_='title')
-                    if td_name:
-                        a = td_name.find('a')
-                        if a and 'code=' in a.get('href', ''):
-                            cd = a['href'].split('code=')[1].strip().zfill(6)
-                            nm = a.text.strip()
-                            if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
-                                continue
-                            page_items.append((cd, nm))
-    except Exception as e:
-        log(f"[!] sosok={sosok} page={page} 에러: {e}")
-    return page_items
-
-log("[*] 코스피/코스닥 전종목 고속 병렬 수집 중...")
-tasks = []
-with ThreadPoolExecutor(max_workers=5) as page_exec:
-    for sosok in [0, 1]:
-        for page in range(1, 36):
-            tasks.append(page_exec.submit(fetch_market_page, sosok, page))
-    
-    for f in as_completed(tasks):
-        res_items = f.result()
-        for cd, nm in res_items:
-            code_to_name[cd] = nm
-
-target_tickers = list(code_to_name.keys())
-log(f"[*] 유효 스캔 대상 종목수: {len(target_tickers)}개 확보 완료")
-
-# 4. 분석 보조 함수
+# ============================================================
+# 4. 분석 보조 함수 및 알고리즘
+# ============================================================
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
@@ -176,7 +182,7 @@ def get_investor_trend(code, latest_df_date):
     try:
         code_str = str(code).strip().zfill(6)
         url = f"https://m.stock.naver.com/api/stock/{code_str}/trend?pageSize=10&page=1"
-        res = session.get(url, timeout=3.0)
+        res = session.get(url, timeout=2.5)
         if res.status_code != 200:
             return "⚪️ 수급 확인불가", 0
             
@@ -258,6 +264,7 @@ def analyze_stock(code):
         if len(sma30_series) < 8:
             return None
 
+        # 와인스타인: 30주선 우상향 또는 바닥 횡보
         is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3] * 0.998)
         if not is_sma30_uptrend:
             return None
@@ -395,7 +402,9 @@ def analyze_stock(code):
     except Exception:
         return None
 
-# 5. 전종목 고속 분석 실행
+# ============================================================
+# 5. 전종목 정밀 스캔 실행
+# ============================================================
 results = []
 log(f"[*] 총 {len(target_tickers)}개 종목 고속 정밀 스캔 시작...")
 
@@ -408,7 +417,9 @@ with ThreadPoolExecutor(max_workers=10) as executor:
 
 log(f"[*] 전종목 분석 완료! 최종 조건 통과 종목: {len(results)}개")
 
+# ============================================================
 # 6. 채점 및 텔레그램 리포트 생성
+# ============================================================
 msg = f"📊 [{today_str} 와인스타인 전종목(1,500+) 100점 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
