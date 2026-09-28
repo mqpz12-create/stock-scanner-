@@ -2,10 +2,9 @@ import os
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
-import io
 
 def log(text):
     print(text, flush=True)
@@ -37,13 +36,11 @@ today_str = datetime.today().strftime("%Y-%m-%d")
 log(f"[*] {today_str} 전종목 1,500개+ 확장 스캐너 구동...")
 
 headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     'Referer': 'https://finance.naver.com/'
 }
 
-# ============================================================
 # 1. 네이버 당일 주도 테마 TOP 10 수집
-# ============================================================
 top_themes = []
 try:
     url = "https://finance.naver.com/sise/theme.naver?&page=1"
@@ -70,13 +67,12 @@ try:
 except Exception as e:
     log(f"[!] 테마 수집 실패: {e}")
 
-# ============================================================
 # 2. 캔들 수집 파이프라인
-# ============================================================
 def get_daily_candle(code, count=400):
-    url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count={count}&requestType=0"
+    code_str = str(code).strip().zfill(6)
+    url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code_str}&timeframe=day&count={count}&requestType=0"
     try:
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=6)
         if r.status_code != 200:
             return None
         lines = r.text.split('\n')
@@ -106,16 +102,14 @@ try:
 except Exception:
     kospi_close = None
 
-# ============================================================
-# 3. 1,500개 이상 전종목 고속 병렬 수집 (페이지 1~35장 스캔)
-# ============================================================
+# 3. 전종목 코드 수집 (zfill 6자리 정규화 패치)
 code_to_name = {}
 
 def fetch_market_page(sosok, page):
     page_items = []
     p_url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}&page={page}"
     try:
-        res = requests.get(p_url, headers=headers, timeout=5)
+        res = requests.get(p_url, headers=headers, timeout=6)
         if res.status_code == 200:
             soup = BeautifulSoup(res.content.decode('euc-kr', 'replace'), 'html.parser')
             table = soup.find('table', class_='type_2')
@@ -125,7 +119,7 @@ def fetch_market_page(sosok, page):
                     if td_name:
                         a = td_name.find('a')
                         if a and 'code=' in a.get('href', ''):
-                            cd = a['href'].split('code=')[1].strip()
+                            cd = a['href'].split('code=')[1].strip().zfill(6)
                             nm = a.text.strip()
                             if '스팩' in nm or nm.endswith('우') or nm.endswith('우B'):
                                 continue
@@ -134,9 +128,9 @@ def fetch_market_page(sosok, page):
         pass
     return page_items
 
-log("[*] 코스피/코스닥 전종목 (1,500개+) 고속 병렬 수집 중...")
+log("[*] 코스피/코스닥 전종목 고속 병렬 수집 중...")
 tasks = []
-with ThreadPoolExecutor(max_workers=10) as page_exec:
+with ThreadPoolExecutor(max_workers=8) as page_exec:
     for sosok in [0, 1]:
         for page in range(1, 36):
             tasks.append(page_exec.submit(fetch_market_page, sosok, page))
@@ -146,11 +140,9 @@ with ThreadPoolExecutor(max_workers=10) as page_exec:
             code_to_name[cd] = nm
 
 target_tickers = list(code_to_name.keys())
-log(f"[*] 최종 스캔 대상 종목수: {len(target_tickers)}개 확보 완료")
+log(f"[*] 유효 스캔 대상 종목수: {len(target_tickers)}개 확보 완료")
 
-# ============================================================
-# 4. 분석 보조 함수 및 알고리즘
-# ============================================================
+# 4. 수급 및 VCP 분석 함수
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
@@ -178,9 +170,10 @@ def get_streak_info(df_d):
 
 def get_investor_trend(code, latest_df_date):
     try:
-        url = f"https://m.stock.naver.com/api/stock/{code}/trend?pageSize=10&page=1"
+        code_str = str(code).strip().zfill(6)
+        url = f"https://m.stock.naver.com/api/stock/{code_str}/trend?pageSize=10&page=1"
         h = {'User-Agent': 'Mozilla/5.0', 'Referer': 'https://m.stock.naver.com/'}
-        res = requests.get(url, headers=h, timeout=2.0)
+        res = requests.get(url, headers=h, timeout=3.0)
         if res.status_code != 200:
             return "⚪️ 수급 확인불가", 0
             
@@ -235,15 +228,15 @@ def get_investor_trend(code, latest_df_date):
 
 def analyze_stock(code):
     try:
+        code = str(code).strip().zfill(6)
         df_d = get_daily_candle(code, count=360)
         if df_d is None or len(df_d) < 180 or kospi_close is None:
             return None
 
         today_vol = float(df_d['Volume'].iloc[-1])
         
-        # [최소 거래량 20만 주 이상 필터] 20만 주 미만인 종목은 즉시 탈락(Drop)
-        MIN_VOLUME_REQUIRED = 200_000
-        if today_vol < MIN_VOLUME_REQUIRED:
+        # 최소 거래량 기준 10만 주로 유연화
+        if today_vol < 100_000:
             return None
 
         df_w = df_d.resample('W-FRI').agg({
@@ -264,16 +257,16 @@ def analyze_stock(code):
         if len(sma30_series) < 8:
             return None
 
-        # 와인스타인: 30주선 우상향 확인
-        is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3]) and (sma30_series.iloc[-1] > sma30_series.iloc[-6])
+        # 30주선 우상향/바닥 횡보 안착
+        is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3] * 0.998)
         if not is_sma30_uptrend:
             return None
 
         sma30 = sma30_series.iloc[-1]
 
-        # 30주선 이격도 필터 (98.0% ~ 112.0% 엄격 유지)
+        # 30주선 이격도 97% ~ 115%로 밴드 완화
         disp = (current_price / sma30) * 100.0
-        if not (98.0 <= disp <= 112.0):
+        if not (97.0 <= disp <= 115.0):
             return None
 
         sma5_val = df_w['SMA5'].iloc[-1]
@@ -300,17 +293,17 @@ def analyze_stock(code):
         is_contracting = (range_20 >= range_10) and (range_10 >= range_5)
 
         pattern_score = 4
-        if is_above_w5 and (is_flag_shape or is_contracting) and range_5 <= 7.0 and vol_50_under:
+        if is_above_w5 and (is_flag_shape or is_contracting) and range_5 <= 8.0 and vol_50_under:
             pattern_tag = f"🚩 주봉5주선 위 완벽VCP (진폭 {range_5:.1f}% | 핸들수축)"
             pattern_score = 15
-        elif (is_flag_shape or is_contracting) and range_5 <= 8.5:
+        elif (is_flag_shape or is_contracting) and range_5 <= 10.0:
             if is_above_w5:
                 pattern_tag = f"⚡️ 주봉5주선 지지 깃발형 (5일 진폭 {range_5:.1f}%)"
                 pattern_score = 12
             else:
                 pattern_tag = f"🛡 30주선 지지/첫반등 (5일 진폭 {range_5:.1f}% | 5주선 매물저항)"
                 pattern_score = 6
-        elif range_5 <= 6.0:
+        elif range_5 <= 7.0:
             pattern_tag = f"🌀 단기 초미세 수렴 (5일 진폭 {range_5:.1f}%)"
             pattern_score = 8
         else:
@@ -320,10 +313,10 @@ def analyze_stock(code):
         pivot_high = int(recent_10['High'].max())
         dist_to_pivot = ((pivot_high - current_price) / current_price) * 100.0
 
-        if is_above_w5 and vol_ratio_sma50 <= 45.0 and range_5 <= 7.0 and dist_to_pivot <= 2.5:
+        if is_above_w5 and vol_ratio_sma50 <= 50.0 and range_5 <= 8.0 and dist_to_pivot <= 3.0:
             buy_trigger_str = f"🚨 [슈팅직전 셋업완료] 피벗 {pivot_high:,}원 돌파 시 즉시발사 (선취매 유효구간)"
             trigger_score = 15
-        elif is_above_w5 and dist_to_pivot <= 3.5 and vol_50_under:
+        elif is_above_w5 and dist_to_pivot <= 4.0 and vol_50_under:
             buy_trigger_str = f"🎯 돌파매수 대기 (10일 피벗 {pivot_high:,}원 돌파 시)"
             trigger_score = 10
         elif is_above_w5:
@@ -404,13 +397,11 @@ def analyze_stock(code):
     except Exception:
         return None
 
-# ============================================================
-# 5. 전종목 고속 분석 실행 (스레드 20개)
-# ============================================================
+# 5. 전종목 고속 병렬 분석 실행
 results = []
 log(f"[*] 총 {len(target_tickers)}개 종목 고속 정밀 스캔 시작...")
 
-with ThreadPoolExecutor(max_workers=20) as executor:
+with ThreadPoolExecutor(max_workers=15) as executor:
     future_to_code = {executor.submit(analyze_stock, code): code for code in target_tickers}
     for future in as_completed(future_to_code):
         res = future.result()
@@ -419,9 +410,7 @@ with ThreadPoolExecutor(max_workers=20) as executor:
 
 log(f"[*] 전종목 분석 완료! 최종 조건 통과 종목: {len(results)}개")
 
-# ============================================================
 # 6. 채점 및 텔레그램 리포트 생성
-# ============================================================
 msg = f"📊 [{today_str} 와인스타인 전종목(1,500+) 100점 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
@@ -438,32 +427,23 @@ if results:
     final_results = []
     for _, r in df_res.iterrows():
         score = 0
-        
-        # 1. 듀얼 Mansfield RS (25점 만점)
         if r['m_rs_long'] > 0 and r['m_rs_short'] > 0: score += 25
         elif r['m_rs_long'] > 0: score += 12
 
-        # 2. 주봉 5주선 안착 여부 (20점 만점)
         if r['is_above_w5']: score += 20
         elif r['is_near_w5']: score += 12
         else: score += 5
 
-        # 3. 50일 거래량 마름 (20점 만점)
         if r['vol_ratio_sma50'] <= 45.0: score += 20
         elif r['vol_50_under']: score += 12
 
-        # 4. 차트 패턴 수축 (10점 만점)
         score += int(round(r['pattern_score'] * 0.67))
-
-        # 5. 슈팅 직전 선취매 상태 가산점 (15점 만점)
         score += r['trigger_score']
 
-        # 6. 30주선 이격 밀착도 (10점 만점)
         if 99.0 <= r['disp'] <= 103.0: score += 10
         elif 103.0 < r['disp'] <= 107.0: score += 7
         else: score += 4
 
-        # 7. 개인 5일 누적 순매도 반영 (+10점 ~ -10점)
         score += r['investor_score']
 
         r_dict = dict(r)
@@ -472,7 +452,6 @@ if results:
 
     df_res = pd.DataFrame(final_results)
     df_sorted = df_res.sort_values(by=["score", "m_rs_long"], ascending=[False, False]).reset_index(drop=True)
-
     df_top = df_sorted.head(15)
 
     msg += f"📋 [포착 종목 셋업 랭킹 TOP {len(df_top)}] (전체 {len(df_sorted)}개 중)\n"
