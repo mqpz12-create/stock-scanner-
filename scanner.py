@@ -145,18 +145,6 @@ with ThreadPoolExecutor(max_workers=10) as page_exec:
         for cd, nm in f.result():
             code_to_name[cd] = nm
 
-must_have = [
-    ("475150", "SK이터닉스"), ("005090", "SGC에너지"), ("065060", "지엔씨에너지"),
-    ("094480", "갤러리아타임월드"), ("327260", "RF머트리얼즈"), ("010170", "대한광통신"),
-    ("028050", "삼성E&A"), ("319660", "피에스케이"), ("080220", "제주반도체"),
-    ("005930", "삼성전자"), ("000660", "SK하이닉스"), ("402340", "SK스퀘어"),
-    ("064290", "인텍플러스"), ("403870", "HPSP"), ("093370", "후성"),
-    ("375500", "DL이앤씨"), ("010120", "LS ELECTRIC")
-]
-
-for cd, nm in must_have:
-    code_to_name[cd] = nm
-
 target_tickers = list(code_to_name.keys())
 log(f"[*] 최종 스캔 대상 종목수: {len(target_tickers)}개 확보 완료")
 
