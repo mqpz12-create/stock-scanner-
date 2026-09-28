@@ -96,13 +96,14 @@ def get_daily_candle(code, count=400):
     except Exception:
         return None
 
+# 코스피 지수 벤치마크로 KODEX 200(069500) 사용 (호출 실패 방지)
 try:
-    df_kospi = get_daily_candle("KOSPI", count=400)
+    df_kospi = get_daily_candle("069500", count=400)
     kospi_close = df_kospi['Close'] if df_kospi is not None else None
 except Exception:
     kospi_close = None
 
-# 3. 전종목 코드 수집 (zfill 6자리 정규화 패치)
+# 3. 전종목 코드 수집
 code_to_name = {}
 
 def fetch_market_page(sosok, page):
@@ -142,7 +143,7 @@ with ThreadPoolExecutor(max_workers=8) as page_exec:
 target_tickers = list(code_to_name.keys())
 log(f"[*] 유효 스캔 대상 종목수: {len(target_tickers)}개 확보 완료")
 
-# 4. 수급 및 VCP 분석 함수
+# 4. 분석 보조 함수
 def make_vol_bar(ratio_pct):
     filled = int(round(min(ratio_pct / 100.0, 1.0) * 10))
     return "■" * filled + "□" * (10 - filled)
@@ -230,12 +231,11 @@ def analyze_stock(code):
     try:
         code = str(code).strip().zfill(6)
         df_d = get_daily_candle(code, count=360)
-        if df_d is None or len(df_d) < 180 or kospi_close is None:
+        # kospi_close 가드 제거 (개별 종목 데이터만 유효하면 분석 진행)
+        if df_d is None or len(df_d) < 180:
             return None
 
         today_vol = float(df_d['Volume'].iloc[-1])
-        
-        # 최소 거래량 기준 10만 주로 유연화
         if today_vol < 100_000:
             return None
 
@@ -257,14 +257,11 @@ def analyze_stock(code):
         if len(sma30_series) < 8:
             return None
 
-        # 30주선 우상향/바닥 횡보 안착
         is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3] * 0.998)
         if not is_sma30_uptrend:
             return None
 
         sma30 = sma30_series.iloc[-1]
-
-        # 30주선 이격도 97% ~ 115%로 밴드 완화
         disp = (current_price / sma30) * 100.0
         if not (97.0 <= disp <= 115.0):
             return None
@@ -329,17 +326,18 @@ def analyze_stock(code):
             buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
             trigger_score = 0
 
-        df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
-        if len(df_rs) >= 120:
-            rs_line = df_rs['stock'] / df_rs['kospi']
-            w_long = min(len(df_rs), 250)
-            rs_sma_long = rs_line.rolling(w_long, min_periods=60).mean()
-            m_rs_long = ((rs_line.iloc[-1] / rs_sma_long.iloc[-1]) - 1.0) * 100.0
+        # RS 계산 시 kospi_close 존재 여부 안전 체크
+        m_rs_long, m_rs_short = 0.0, 0.0
+        if kospi_close is not None:
+            df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
+            if len(df_rs) >= 120:
+                rs_line = df_rs['stock'] / df_rs['kospi']
+                w_long = min(len(df_rs), 250)
+                rs_sma_long = rs_line.rolling(w_long, min_periods=60).mean()
+                m_rs_long = ((rs_line.iloc[-1] / rs_sma_long.iloc[-1]) - 1.0) * 100.0
 
-            rs_sma_short = rs_line.rolling(60, min_periods=30).mean()
-            m_rs_short = ((rs_line.iloc[-1] / rs_sma_short.iloc[-1]) - 1.0) * 100.0
-        else:
-            m_rs_long, m_rs_short = 0.0, 0.0
+                rs_sma_short = rs_line.rolling(60, min_periods=30).mean()
+                m_rs_short = ((rs_line.iloc[-1] / rs_sma_short.iloc[-1]) - 1.0) * 100.0
 
         if m_rs_long >= 20.0 and m_rs_short > 0:
             rs_tag = f"👑 장단기 듀얼 슈퍼스톡 (RS 장기+{m_rs_long:.1f} / 단기+{m_rs_short:.1f})"
@@ -348,7 +346,7 @@ def analyze_stock(code):
         elif m_rs_long > 0:
             rs_tag = f"🟢 장기 추세 우위 (RS 장기+{m_rs_long:.1f} / 단기{m_rs_short:+.1f})"
         else:
-            rs_tag = f"⚪️ 지수 하회 (RS 장기{m_rs_long:.1f} / 단기{m_rs_short:+.1f})"
+            rs_tag = f"⚪️ 지수 동행/하회 (RS 장기{m_rs_long:+.1f} / 단기{m_rs_short:+.1f})"
 
         investor_tag, investor_score = get_investor_trend(code, latest_date)
 
@@ -397,7 +395,7 @@ def analyze_stock(code):
     except Exception:
         return None
 
-# 5. 전종목 고속 병렬 분석 실행
+# 5. 전종목 고속 분석 실행
 results = []
 log(f"[*] 총 {len(target_tickers)}개 종목 고속 정밀 스캔 시작...")
 
