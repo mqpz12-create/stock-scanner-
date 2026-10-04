@@ -272,7 +272,7 @@ def analyze_stock(code):
         if len(sma30_series) < 8:
             return None
 
-        # 와인스타인: 30주선 우상향/바닥 다지기
+        # 와인스타인: 30주선 우상향/바닥 다지기 필터
         is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3] * 0.998)
         if not is_sma30_uptrend:
             return None
@@ -280,6 +280,17 @@ def analyze_stock(code):
         sma30 = sma30_series.iloc[-1]
         disp = (current_price / sma30) * 100.0
         if not (97.0 <= disp <= 115.0):
+            return None
+
+        # ============================================================
+        # [신규 추가] 일봉 기준 30일 이평선 이격도 필터 (-4% ~ +6%)
+        # ============================================================
+        sma30_daily = df_d['Close'].rolling(30).mean().iloc[-1]
+        if pd.isna(sma30_daily):
+            return None
+        
+        disp_daily_30 = (current_price / sma30_daily) * 100.0
+        if not (96.0 <= disp_daily_30 <= 106.0):  # -4% (96.0) ~ +6% (106.0)
             return None
 
         sma5_val = df_w['SMA5'].iloc[-1]
@@ -388,10 +399,12 @@ def analyze_stock(code):
             "price": current_price,
             "chg_str": chg_str,
             "sma30": int(round(sma30)),
+            "sma30_daily": int(round(sma30_daily)),
             "sma5_w": int(round(sma5_val)),
             "is_above_w5": is_above_w5,
             "is_near_w5": is_near_w5,
             "disp": round(disp, 1),
+            "disp_daily_30": round(disp_daily_30, 1),
             "vol_today": int(today_vol),
             "vol_ratio_prev": round(vol_ratio_prev, 1),
             "vol_ratio_sma50": round(vol_ratio_sma50, 1),
@@ -484,7 +497,7 @@ if results:
         msg += f"   - 패턴: {r['pattern_tag']}\n"
         msg += f"   - 수급: {r['investor']}\n"
         msg += f"   - 상대강도: {r['rs']}\n"
-        msg += f"   - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 주봉5주선: {r['sma5_w']:,}원\n"
+        msg += f"   - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 일봉 30일선: {r['sma30_daily']:,}원 (이격: {r['disp_daily_30']}%)\n"
         msg += f"   - 50일거래비: {r['vol_ratio_sma50']}% [{bar}] | 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n\n"
 else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
