@@ -33,7 +33,7 @@ def send_telegram(message):
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-log(f"[*] {today_str} 스테이지2 30주선/30일선 동시 지지 VCP 스캐너 가동...")
+log(f"[*] {today_str} 스테이지2 30주/30일선 동시지지 VCP 스캐너 (조건완화) 가동...")
 
 session = requests.Session()
 session.headers.update({
@@ -177,7 +177,7 @@ def get_investor_trend(code, latest_df_date):
         code_str = str(code).strip().zfill(6)
         url = f"https://m.stock.naver.com/api/stock/{code_str}/trend?pageSize=10&page=1"
         res = session.get(url, timeout=2.0)
-        if res.status_code != 200: return "⚪️️ 수급 확인불가", 0
+        if res.status_code != 200: return "⚪ 수급 확인불가", 0
         data = res.json()
         trends = data.get('message', []) if isinstance(data, dict) and 'message' in data else data
         if not trends: return "⚪️ 수급 확인불가", 0
@@ -255,14 +255,14 @@ def analyze_stock(code):
             return None
 
         # ============================================================
-        # [핵심 수정 1] 30주선 5주 이상 연속 상승 추세 (스테이지 2 검증)
+        # [완화 1] 30주선이 5주 전과 비교해 밑으로 꺾이지만 않으면 통과 (0.995 버퍼)
         # ============================================================
-        is_sma30_uptrend_5w = all(sma30_series.iloc[-i] >= sma30_series.iloc[-i-1] for i in range(1, 6))
+        is_sma30_uptrend_5w = (sma30_series.iloc[-1] >= sma30_series.iloc[-5] * 0.995)
         if not is_sma30_uptrend_5w:
             return None
 
         # ============================================================
-        # [핵심 수정 2] 상대강도(RS) 장기 양수 필수 (시장 소외주 탈락)
+        # [완화 2] 상대강도(RS) 음수 탈락 강제 필터 삭제. 점수 채점으로만 활용
         # ============================================================
         m_rs_long, m_rs_short = 0.0, 0.0
         if kospi_close is not None:
@@ -276,16 +276,13 @@ def analyze_stock(code):
                 rs_sma_short = rs_line.rolling(60, min_periods=30).mean()
                 m_rs_short = ((rs_line.iloc[-1] / rs_sma_short.iloc[-1]) - 1.0) * 100.0
 
-        if m_rs_long <= 0:  # 장기적으로 시장보다 약한 역배열/소외주 배제
-            return None
-
         # ============================================================
-        # [핵심 수정 3] 30주선 & 30일선 동시 지지 수렴 구간 필터링 (딱 그 자리)
+        # [완화 3] 30주선 & 30일선 동시 지지 수렴 구간 이격도 확장
         # ============================================================
         sma30 = sma30_series.iloc[-1]
         disp = (current_price / sma30) * 100.0
-        # 30주선에서 멀리 달아나지 않고 딱 지지받는 자리 (-2% ~ +6%)
-        if not (98.0 <= disp <= 106.0):
+        # 30주선 이격도 -3% ~ +8%
+        if not (97.0 <= disp <= 108.0):
             return None
 
         sma30_daily = df_d['Close'].rolling(30).mean().iloc[-1]
@@ -293,8 +290,8 @@ def analyze_stock(code):
             return None
         
         disp_daily_30 = (current_price / sma30_daily) * 100.0
-        # 일봉 30일선에서도 딱 지지받는 자리 (-3% ~ +5%)
-        if not (97.0 <= disp_daily_30 <= 105.0):
+        # 일봉 30일선 이격도 -4% ~ +6%
+        if not (96.0 <= disp_daily_30 <= 106.0):
             return None
 
         # 보조 지표 계산
@@ -324,8 +321,10 @@ def analyze_stock(code):
             rs_tag = f"👑 장단기 듀얼 슈퍼스톡 (RS 장기+{m_rs_long:.1f} / 단기+{m_rs_short:.1f})"
         elif m_rs_long > 0 and m_rs_short > 0:
             rs_tag = f"🔥 장단기 동반 우상향 (RS 장기+{m_rs_long:.1f} / 단기+{m_rs_short:.1f})"
-        else:
+        elif m_rs_long > 0:
             rs_tag = f"🟢 장기 추세 우위 (RS 장기+{m_rs_long:.1f} / 단기{m_rs_short:+.1f})"
+        else:
+            rs_tag = f"⚪️ 지수 동행/하회 (RS 장기{m_rs_long:+.1f} / 단기{m_rs_short:+.1f})"
 
         investor_tag, _ = get_investor_trend(code, latest_date)
 
@@ -405,18 +404,20 @@ if results:
             score += 25
         elif r['m_rs_long'] > 0 and r['m_rs_short'] > 0: 
             score += 20
-        else: 
+        elif r['m_rs_long'] > 0: 
             score += 15
+        else:
+            score += 5 # 장기 RS 음수라도 지지선 안착했으면 기본 점수 부여
 
-        # 2. 30주선 이격도 (25점) - 지지선 밀착도
+        # 2. 30주선 이격도 (25점)
         if 99.0 <= r['disp'] <= 102.5: 
             score += 25
-        elif 102.5 < r['disp'] <= 104.5: 
+        elif 102.5 < r['disp'] <= 105.0: 
             score += 18
         else: 
             score += 10
 
-        # 3. 일봉 30일선 이격도 (25점) - 지지선 밀착도
+        # 3. 일봉 30일선 이격도 (25점)
         if 99.0 <= r['disp_daily_30'] <= 102.0: 
             score += 25
         elif 102.0 < r['disp_daily_30'] <= 104.0: 
