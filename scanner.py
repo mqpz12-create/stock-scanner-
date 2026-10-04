@@ -17,7 +17,6 @@ def send_telegram(message):
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     
-    # 텔레그램 메시지 길이 제한(4,096자) 대응: 3,000자 단위 안전 분할
     max_len = 3000
     msg_chunks = [message[i:i+max_len] for i in range(0, len(message), max_len)]
     
@@ -34,7 +33,7 @@ def send_telegram(message):
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-log(f"[*] {today_str} 100점 만점 개별주 VCP 스캐너 가동...")
+log(f"[*] {today_str} 스테이지2 30주선/30일선 동시 지지 VCP 스캐너 가동...")
 
 session = requests.Session()
 session.headers.update({
@@ -71,11 +70,9 @@ except Exception as e:
     log(f"[!] 테마 수집 실패: {e}")
 
 # ============================================================
-# 2. 전종목 리스트 API 고속 확보 (ETF/ETN/인덱스 전수 차단)
+# 2. 전종목 리스트 API 확보 (ETF/ETN/인덱스 전수 차단)
 # ============================================================
 code_to_name = {}
-
-# 국내 모든 ETF 운용사 브랜드 및 파생/지수 키워드 전수 차단
 EXCLUDE_KEYWORDS = [
     'KODEX', 'TIGER', 'ACE', 'KBSTAR', 'RISE', 'SOL', 'PLUS', 'HANARO', 
     'KOSEF', 'KIWOOM', 'TIMEFOLIO', '히어로즈', 'WOORI', 'WON', '하나로', 
@@ -85,24 +82,18 @@ EXCLUDE_KEYWORDS = [
 
 def get_market_tickers(market_type):
     items = []
-    # 코스피/코스닥 각 25페이지 (총 약 3,000개 수집 후 필터링)
     for page in range(1, 26):
         api_url = f"https://m.stock.naver.com/api/stocks/marketValue/{market_type}?page={page}&pageSize=60"
         try:
             r = session.get(api_url, timeout=4)
-            if r.status_code != 200:
-                break
+            if r.status_code != 200: break
             data = r.json()
             stocks = data.get('stocks', [])
-            if not stocks:
-                break
+            if not stocks: break
             for s in stocks:
                 cd = str(s.get('itemCode', '')).strip().zfill(6)
                 nm = str(s.get('stockName', '')).strip()
-                if not cd or not nm:
-                    continue
-                
-                # ETF 브랜드, 우선주, 스팩 철저 배제
+                if not cd or not nm: continue
                 if any(k in nm for k in EXCLUDE_KEYWORDS) or nm.endswith('우') or nm.endswith('우B') or nm.endswith('3우C'):
                     continue
                 items.append((cd, nm))
@@ -114,7 +105,6 @@ log("[*] 코스피/코스닥 순수 개별주 취득 중...")
 with ThreadPoolExecutor(max_workers=2) as exec_ticker:
     f_kospi = exec_ticker.submit(get_market_tickers, "KOSPI")
     f_kosdaq = exec_ticker.submit(get_market_tickers, "KOSDAQ")
-    
     for cd, nm in f_kospi.result() + f_kosdaq.result():
         code_to_name[cd] = nm
 
@@ -129,8 +119,7 @@ def get_daily_candle(code, count=400):
     url = f"https://fchart.stock.naver.com/sise.nhn?symbol={code_str}&timeframe=day&count={count}&requestType=0"
     try:
         r = session.get(url, timeout=3.5)
-        if r.status_code != 200:
-            return None
+        if r.status_code != 200: return None
         lines = r.text.split('\n')
         rows = []
         for l in lines:
@@ -144,8 +133,7 @@ def get_daily_candle(code, count=400):
                     'Close': float(val[4]),
                     'Volume': float(val[5])
                 })
-        if not rows:
-            return None
+        if not rows: return None
         df = pd.DataFrame(rows)
         df.set_index('Date', inplace=True)
         return df
@@ -168,12 +156,10 @@ def make_vol_bar(ratio_pct):
 def get_streak_info(df_d):
     try:
         closes = df_d['Close'].values
-        if len(closes) < 5:
-            return ""
+        if len(closes) < 5: return ""
         diffs = [closes[i] - closes[i-1] for i in range(1, len(closes))]
         last_diff = diffs[-1]
         prev_diff = diffs[-2]
-        
         if last_diff > 0 and prev_diff <= 0: return "⚡️첫 상승전환"
         elif last_diff < 0 and prev_diff >= 0: return "💧첫 하락전환"
         elif last_diff > 0:
@@ -191,13 +177,10 @@ def get_investor_trend(code, latest_df_date):
         code_str = str(code).strip().zfill(6)
         url = f"https://m.stock.naver.com/api/stock/{code_str}/trend?pageSize=10&page=1"
         res = session.get(url, timeout=2.0)
-        if res.status_code != 200:
-            return "⚪️ 수급 확인불가", 0
-            
+        if res.status_code != 200: return "⚪️️ 수급 확인불가", 0
         data = res.json()
         trends = data.get('message', []) if isinstance(data, dict) and 'message' in data else data
-        if not trends:
-            return "⚪️ 수급 확인불가", 0
+        if not trends: return "⚪️ 수급 확인불가", 0
 
         target_idx = 0
         target_date_str = latest_df_date.strftime("%Y%m%d")
@@ -238,7 +221,6 @@ def get_investor_trend(code, latest_df_date):
         else:
             tag = "⚪️ 수급 중립 공방"
             score = 0
-
         return tag, score
     except Exception:
         return "⚪️ 수급 확인불가", 0
@@ -258,7 +240,7 @@ def analyze_stock(code):
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
         }).dropna()
 
-        if len(df_w) < 35:
+        if len(df_w) < 36:
             return None
 
         df_w['SMA5'] = df_w['Close'].rolling(5).mean()
@@ -269,30 +251,53 @@ def analyze_stock(code):
         latest_date = df_d.index[-1]
 
         sma30_series = df_w['SMA30'].dropna()
-        if len(sma30_series) < 8:
+        if len(sma30_series) < 6:
             return None
 
-        # 와인스타인: 30주선 우상향/바닥 다지기 필터
-        is_sma30_uptrend = (sma30_series.iloc[-1] >= sma30_series.iloc[-3] * 0.998)
-        if not is_sma30_uptrend:
+        # ============================================================
+        # [핵심 수정 1] 30주선 5주 이상 연속 상승 추세 (스테이지 2 검증)
+        # ============================================================
+        is_sma30_uptrend_5w = all(sma30_series.iloc[-i] >= sma30_series.iloc[-i-1] for i in range(1, 6))
+        if not is_sma30_uptrend_5w:
             return None
 
+        # ============================================================
+        # [핵심 수정 2] 상대강도(RS) 장기 양수 필수 (시장 소외주 탈락)
+        # ============================================================
+        m_rs_long, m_rs_short = 0.0, 0.0
+        if kospi_close is not None:
+            df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
+            if len(df_rs) >= 120:
+                rs_line = df_rs['stock'] / df_rs['kospi']
+                w_long = min(len(df_rs), 250)
+                rs_sma_long = rs_line.rolling(w_long, min_periods=60).mean()
+                m_rs_long = ((rs_line.iloc[-1] / rs_sma_long.iloc[-1]) - 1.0) * 100.0
+
+                rs_sma_short = rs_line.rolling(60, min_periods=30).mean()
+                m_rs_short = ((rs_line.iloc[-1] / rs_sma_short.iloc[-1]) - 1.0) * 100.0
+
+        if m_rs_long <= 0:  # 장기적으로 시장보다 약한 역배열/소외주 배제
+            return None
+
+        # ============================================================
+        # [핵심 수정 3] 30주선 & 30일선 동시 지지 수렴 구간 필터링 (딱 그 자리)
+        # ============================================================
         sma30 = sma30_series.iloc[-1]
         disp = (current_price / sma30) * 100.0
-        if not (97.0 <= disp <= 115.0):
+        # 30주선에서 멀리 달아나지 않고 딱 지지받는 자리 (-2% ~ +6%)
+        if not (98.0 <= disp <= 106.0):
             return None
 
-        # ============================================================
-        # 일봉 기준 30일 이평선 이격도 필터 (-4% ~ +6%)
-        # ============================================================
         sma30_daily = df_d['Close'].rolling(30).mean().iloc[-1]
         if pd.isna(sma30_daily):
             return None
         
         disp_daily_30 = (current_price / sma30_daily) * 100.0
-        if not (96.0 <= disp_daily_30 <= 106.0):  # -4% (96.0) ~ +6% (106.0)
+        # 일봉 30일선에서도 딱 지지받는 자리 (-3% ~ +5%)
+        if not (97.0 <= disp_daily_30 <= 105.0):
             return None
 
+        # 보조 지표 계산
         sma5_val = df_w['SMA5'].iloc[-1]
         is_above_w5 = (current_price >= sma5_val)
         is_near_w5 = (not is_above_w5) and (current_price >= sma5_val * 0.975)
@@ -308,63 +313,21 @@ def analyze_stock(code):
         recent_10 = df_d.iloc[-10:]
         recent_5 = df_d.iloc[-5:]
 
-        range_20 = (recent_20['High'].max() - recent_20['Low'].min()) / current_price * 100.0
-        range_10 = (recent_10['High'].max() - recent_10['Low'].min()) / current_price * 100.0
         range_5 = (recent_5['High'].max() - recent_5['Low'].min()) / current_price * 100.0
-
-        high_20d_idx = recent_20['High'].values.argmax()
-        is_flag_shape = (high_20d_idx < 15) and (recent_5['High'].max() < recent_20['High'].max())
-        is_contracting = (range_20 >= range_10) and (range_10 >= range_5)
-
-        pattern_score = 4
-        if is_above_w5 and (is_flag_shape or is_contracting) and range_5 <= 8.0 and vol_50_under:
-            pattern_tag = f"🚩 주봉5주선 위 완벽VCP (진폭 {range_5:.1f}% | 핸들수축)"
-        elif (is_flag_shape or is_contracting) and range_5 <= 10.0:
-            if is_above_w5:
-                pattern_tag = f"⚡️ 주봉5주선 지지 깃발형 (5일 진폭 {range_5:.1f}%)"
-            else:
-                pattern_tag = f"🛡 30주선 지지/첫반등 (5일 진폭 {range_5:.1f}% | 5주선 매물저항)"
-        elif range_5 <= 7.0:
-            pattern_tag = f"🌀 단기 초미세 수렴 (5일 진폭 {range_5:.1f}%)"
-        else:
-            pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
-
         pivot_high = int(recent_10['High'].max())
         dist_to_pivot = ((pivot_high - current_price) / current_price) * 100.0
 
-        if is_above_w5 and vol_ratio_sma50 <= 50.0 and range_5 <= 8.0 and dist_to_pivot <= 3.0:
-            buy_trigger_str = f"🚨 [슈팅직전 셋업완료] 피벗 {pivot_high:,}원 돌파 시 즉시발사 (선취매 유효구간)"
-        elif is_above_w5 and dist_to_pivot <= 4.0 and vol_50_under:
-            buy_trigger_str = f"🎯 돌파매수 대기 (10일 피벗 {pivot_high:,}원 돌파 시)"
-        elif is_above_w5:
-            buy_trigger_str = f"⏳ 베이스 수축 진행 (피벗 {pivot_high:,}원 | 이격 +{dist_to_pivot:.1f}%)"
-        elif is_near_w5:
-            buy_trigger_str = f"⚡️ 5주선 돌파 임박 (머리 위 5주선: {int(round(sma5_val)):,}원 | 이격 {((sma5_val-current_price)/current_price*100):.1f}%)"
-        else:
-            buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
-
-        m_rs_long, m_rs_short = 0.0, 0.0
-        if kospi_close is not None:
-            df_rs = pd.DataFrame({'stock': df_d['Close'], 'kospi': kospi_close}).dropna()
-            if len(df_rs) >= 120:
-                rs_line = df_rs['stock'] / df_rs['kospi']
-                w_long = min(len(df_rs), 250)
-                rs_sma_long = rs_line.rolling(w_long, min_periods=60).mean()
-                m_rs_long = ((rs_line.iloc[-1] / rs_sma_long.iloc[-1]) - 1.0) * 100.0
-
-                rs_sma_short = rs_line.rolling(60, min_periods=30).mean()
-                m_rs_short = ((rs_line.iloc[-1] / rs_sma_short.iloc[-1]) - 1.0) * 100.0
+        buy_trigger_str = f"🎯 지지 후 피벗 돌파 대기 (10일 피벗 {pivot_high:,}원 | 이격 +{dist_to_pivot:.1f}%)"
+        pattern_tag = f"🛡 30주선·30일선 이중지지 (5일 진폭 {range_5:.1f}%)"
 
         if m_rs_long >= 20.0 and m_rs_short > 0:
             rs_tag = f"👑 장단기 듀얼 슈퍼스톡 (RS 장기+{m_rs_long:.1f} / 단기+{m_rs_short:.1f})"
         elif m_rs_long > 0 and m_rs_short > 0:
             rs_tag = f"🔥 장단기 동반 우상향 (RS 장기+{m_rs_long:.1f} / 단기+{m_rs_short:.1f})"
-        elif m_rs_long > 0:
-            rs_tag = f"🟢 장기 추세 우위 (RS 장기+{m_rs_long:.1f} / 단기{m_rs_short:+.1f})"
         else:
-            rs_tag = f"⚪️ 지수 동행/하회 (RS 장기{m_rs_long:+.1f} / 단기{m_rs_short:+.1f})"
+            rs_tag = f"🟢 장기 추세 우위 (RS 장기+{m_rs_long:.1f} / 단기{m_rs_short:+.1f})"
 
-        investor_tag, investor_score = get_investor_trend(code, latest_date)
+        investor_tag, _ = get_investor_trend(code, latest_date)
 
         chg_pct = ((current_price - prev_close) / prev_close) * 100.0
         streak_tag = get_streak_info(df_d)
@@ -375,13 +338,6 @@ def analyze_stock(code):
 
         name = code_to_name.get(code, code)
         name = name.replace("[", "").replace("]", "").replace("*", "")
-
-        if 99.0 <= disp <= 103.0:
-            tag = "30주선 초밀착"
-        elif disp < 99.0:
-            tag = "일시 언더슈팅"
-        else:
-            tag = "30주선 위 지지"
 
         return {
             "code": code,
@@ -399,7 +355,6 @@ def analyze_stock(code):
             "vol_ratio_prev": round(vol_ratio_prev, 1),
             "vol_ratio_sma50": round(vol_ratio_sma50, 1),
             "vol_50_under": vol_50_under,
-            "tag": tag,
             "pattern_tag": pattern_tag,
             "buy_trigger_str": buy_trigger_str,
             "rs": rs_tag,
@@ -426,9 +381,9 @@ with ThreadPoolExecutor(max_workers=25) as executor:
 log(f"[*] 전종목 분석 완료! 최종 조건 통과 종목: {len(results)}개")
 
 # ============================================================
-# 6. 채점 및 텔레그램 리포트 생성 (100점 만점 균등 배점)
+# 6. 100점 만점 채점 및 텔레그램 리포트 생성
 # ============================================================
-msg = f"📊 [{today_str} 와인스타인 순수 개별주 VCP 리포트]\n"
+msg = f"📊 [{today_str} 스테이지2 30주선/30일선 동시 지지 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
 
 if top_themes:
@@ -445,38 +400,38 @@ if results:
     for _, r in df_res.iterrows():
         score = 0
         
-        # 1. 상대강도 추세 (최대 25점)
+        # 1. 상대강도 추세 (25점)
         if r['m_rs_long'] >= 20.0 and r['m_rs_short'] > 0: 
             score += 25
         elif r['m_rs_long'] > 0 and r['m_rs_short'] > 0: 
             score += 20
-        elif r['m_rs_long'] > 0: 
-            score += 10
-
-        # 2. 주봉 30주선 이격도 (최대 25점)
-        if 99.0 <= r['disp'] <= 103.0: 
-            score += 25
-        elif 103.0 < r['disp'] <= 107.0: 
-            score += 15
-        elif 98.0 <= r['disp'] < 99.0: 
-            score += 10
         else: 
-            score += 5
+            score += 15
 
-        # 3. 일봉 30일선 이격도 (최대 25점)
+        # 2. 30주선 이격도 (25점) - 지지선 밀착도
+        if 99.0 <= r['disp'] <= 102.5: 
+            score += 25
+        elif 102.5 < r['disp'] <= 104.5: 
+            score += 18
+        else: 
+            score += 10
+
+        # 3. 일봉 30일선 이격도 (25점) - 지지선 밀착도
         if 99.0 <= r['disp_daily_30'] <= 102.0: 
             score += 25
-        elif (102.0 < r['disp_daily_30'] <= 104.0) or (97.0 <= r['disp_daily_30'] < 99.0): 
-            score += 15
+        elif 102.0 < r['disp_daily_30'] <= 104.0: 
+            score += 18
         else: 
-            score += 5
+            score += 10
 
-        # 4. 거래량 수축도 (최대 25점)
+        # 4. 거래량 수축도 (25점)
         if r['vol_ratio_sma50'] <= 45.0: 
             score += 25
-        elif r['vol_ratio_sma50'] <= 75.0: 
-            score += 15
+        elif r['vol_ratio_sma50'] <= 70.0: 
+            score += 18
         elif r['vol_50_under']: 
+            score += 10
+        else:
             score += 5
 
         r_dict = dict(r)
@@ -484,10 +439,7 @@ if results:
         final_results.append(r_dict)
 
     df_res = pd.DataFrame(final_results)
-    # 총점(score) 1순위, 장기 상대강도(m_rs_long) 2순위로 내림차순 정렬
     df_sorted = df_res.sort_values(by=["score", "m_rs_long"], ascending=[False, False]).reset_index(drop=True)
-    
-    # 상위 30개 출력 적용
     df_top = df_sorted.head(30)
 
     msg += f"📋 [포착 종목 셋업 랭킹 TOP {len(df_top)}] (전체 {len(df_sorted)}개 중)\n"
@@ -496,8 +448,7 @@ if results:
         bar = make_vol_bar(r['vol_ratio_sma50'])
         w5_mark = "🟢5주선위(상방열림)" if r['is_above_w5'] else ("⚡️5주선돌파임박" if r['is_near_w5'] else "🟡5주선아래(매물저항)")
         
-        # 100점 만점 기준 점수 표시
-        msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점/100점 | {r['tag']} | {w5_mark}]\n"
+        msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점/100점 | 30주선·30일선 동시지지 | {w5_mark}]\n"
         msg += f"   - 매수타점: {r['buy_trigger_str']}\n"
         msg += f"   - 패턴: {r['pattern_tag']}\n"
         msg += f"   - 수급: {r['investor']}\n"
