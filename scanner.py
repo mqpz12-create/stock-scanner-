@@ -34,7 +34,7 @@ def send_telegram(message):
             log(f"[!] 전송 에러: {e}")
 
 today_str = datetime.today().strftime("%Y-%m-%d")
-log(f"[*] {today_str} 순수 개별주 TOP 30 VCP 스캐너 가동...")
+log(f"[*] {today_str} 100점 만점 개별주 VCP 스캐너 가동...")
 
 session = requests.Session()
 session.headers.update({
@@ -283,7 +283,7 @@ def analyze_stock(code):
             return None
 
         # ============================================================
-        # [신규 추가] 일봉 기준 30일 이평선 이격도 필터 (-4% ~ +6%)
+        # 일봉 기준 30일 이평선 이격도 필터 (-4% ~ +6%)
         # ============================================================
         sma30_daily = df_d['Close'].rolling(30).mean().iloc[-1]
         if pd.isna(sma30_daily):
@@ -319,39 +319,29 @@ def analyze_stock(code):
         pattern_score = 4
         if is_above_w5 and (is_flag_shape or is_contracting) and range_5 <= 8.0 and vol_50_under:
             pattern_tag = f"🚩 주봉5주선 위 완벽VCP (진폭 {range_5:.1f}% | 핸들수축)"
-            pattern_score = 15
         elif (is_flag_shape or is_contracting) and range_5 <= 10.0:
             if is_above_w5:
                 pattern_tag = f"⚡️ 주봉5주선 지지 깃발형 (5일 진폭 {range_5:.1f}%)"
-                pattern_score = 12
             else:
                 pattern_tag = f"🛡 30주선 지지/첫반등 (5일 진폭 {range_5:.1f}% | 5주선 매물저항)"
-                pattern_score = 6
         elif range_5 <= 7.0:
             pattern_tag = f"🌀 단기 초미세 수렴 (5일 진폭 {range_5:.1f}%)"
-            pattern_score = 8
         else:
             pattern_tag = f"30주선 지지 채널 (5일 진폭 {range_5:.1f}%)"
-            pattern_score = 4
 
         pivot_high = int(recent_10['High'].max())
         dist_to_pivot = ((pivot_high - current_price) / current_price) * 100.0
 
         if is_above_w5 and vol_ratio_sma50 <= 50.0 and range_5 <= 8.0 and dist_to_pivot <= 3.0:
             buy_trigger_str = f"🚨 [슈팅직전 셋업완료] 피벗 {pivot_high:,}원 돌파 시 즉시발사 (선취매 유효구간)"
-            trigger_score = 15
         elif is_above_w5 and dist_to_pivot <= 4.0 and vol_50_under:
             buy_trigger_str = f"🎯 돌파매수 대기 (10일 피벗 {pivot_high:,}원 돌파 시)"
-            trigger_score = 10
         elif is_above_w5:
             buy_trigger_str = f"⏳ 베이스 수축 진행 (피벗 {pivot_high:,}원 | 이격 +{dist_to_pivot:.1f}%)"
-            trigger_score = 5
         elif is_near_w5:
             buy_trigger_str = f"⚡️ 5주선 돌파 임박 (머리 위 5주선: {int(round(sma5_val)):,}원 | 이격 {((sma5_val-current_price)/current_price*100):.1f}%)"
-            trigger_score = 4
         else:
             buy_trigger_str = f"⛔️ 5주선 매물저항 구간 (머리 위 5주선: {int(round(sma5_val)):,}원)"
-            trigger_score = 0
 
         m_rs_long, m_rs_short = 0.0, 0.0
         if kospi_close is not None:
@@ -411,14 +401,11 @@ def analyze_stock(code):
             "vol_50_under": vol_50_under,
             "tag": tag,
             "pattern_tag": pattern_tag,
-            "pattern_score": pattern_score,
             "buy_trigger_str": buy_trigger_str,
-            "trigger_score": trigger_score,
             "rs": rs_tag,
             "m_rs_long": m_rs_long,
             "m_rs_short": m_rs_short,
-            "investor": investor_tag,
-            "investor_score": investor_score
+            "investor": investor_tag
         }
     except Exception:
         return None
@@ -439,7 +426,7 @@ with ThreadPoolExecutor(max_workers=25) as executor:
 log(f"[*] 전종목 분석 완료! 최종 조건 통과 종목: {len(results)}개")
 
 # ============================================================
-# 6. 채점 및 텔레그램 리포트 생성 (상위 30개 확장 출력)
+# 6. 채점 및 텔레그램 리포트 생성 (100점 만점 균등 배점)
 # ============================================================
 msg = f"📊 [{today_str} 와인스타인 순수 개별주 VCP 리포트]\n"
 msg += f"• 조건 충족 종목수: 총 {len(results)}개\n\n"
@@ -457,30 +444,47 @@ if results:
     final_results = []
     for _, r in df_res.iterrows():
         score = 0
-        if r['m_rs_long'] > 0 and r['m_rs_short'] > 0: score += 25
-        elif r['m_rs_long'] > 0: score += 12
+        
+        # 1. 상대강도 추세 (최대 25점)
+        if r['m_rs_long'] >= 20.0 and r['m_rs_short'] > 0: 
+            score += 25
+        elif r['m_rs_long'] > 0 and r['m_rs_short'] > 0: 
+            score += 20
+        elif r['m_rs_long'] > 0: 
+            score += 10
 
-        if r['is_above_w5']: score += 20
-        elif r['is_near_w5']: score += 12
-        else: score += 5
+        # 2. 주봉 30주선 이격도 (최대 25점)
+        if 99.0 <= r['disp'] <= 103.0: 
+            score += 25
+        elif 103.0 < r['disp'] <= 107.0: 
+            score += 15
+        elif 98.0 <= r['disp'] < 99.0: 
+            score += 10
+        else: 
+            score += 5
 
-        if r['vol_ratio_sma50'] <= 45.0: score += 20
-        elif r['vol_50_under']: score += 12
+        # 3. 일봉 30일선 이격도 (최대 25점)
+        if 99.0 <= r['disp_daily_30'] <= 102.0: 
+            score += 25
+        elif (102.0 < r['disp_daily_30'] <= 104.0) or (97.0 <= r['disp_daily_30'] < 99.0): 
+            score += 15
+        else: 
+            score += 5
 
-        score += int(round(r['pattern_score'] * 0.67))
-        score += r['trigger_score']
-
-        if 99.0 <= r['disp'] <= 103.0: score += 10
-        elif 103.0 < r['disp'] <= 107.0: score += 7
-        else: score += 4
-
-        score += r['investor_score']
+        # 4. 거래량 수축도 (최대 25점)
+        if r['vol_ratio_sma50'] <= 45.0: 
+            score += 25
+        elif r['vol_ratio_sma50'] <= 75.0: 
+            score += 15
+        elif r['vol_50_under']: 
+            score += 5
 
         r_dict = dict(r)
-        r_dict['score'] = max(score, 0)
+        r_dict['score'] = score
         final_results.append(r_dict)
 
     df_res = pd.DataFrame(final_results)
+    # 총점(score) 1순위, 장기 상대강도(m_rs_long) 2순위로 내림차순 정렬
     df_sorted = df_res.sort_values(by=["score", "m_rs_long"], ascending=[False, False]).reset_index(drop=True)
     
     # 상위 30개 출력 적용
@@ -492,12 +496,13 @@ if results:
         bar = make_vol_bar(r['vol_ratio_sma50'])
         w5_mark = "🟢5주선위(상방열림)" if r['is_above_w5'] else ("⚡️5주선돌파임박" if r['is_near_w5'] else "🟡5주선아래(매물저항)")
         
-        msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점 | {r['tag']} | {w5_mark}]\n"
+        # 100점 만점 기준 점수 표시
+        msg += f"{rank}. {r['name']} ({r['price']:,}원 | {r['chg_str']}) [{r['score']}점/100점 | {r['tag']} | {w5_mark}]\n"
         msg += f"   - 매수타점: {r['buy_trigger_str']}\n"
         msg += f"   - 패턴: {r['pattern_tag']}\n"
         msg += f"   - 수급: {r['investor']}\n"
         msg += f"   - 상대강도: {r['rs']}\n"
-        msg += f"   - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 일봉 30일선: {r['sma30_daily']:,}원 (이격: {r['disp_daily_30']}%)\n"
+        msg += f"   - 30주선: {r['sma30']:,}원 (이격: {r['disp']}%) | 일봉30일선: {r['sma30_daily']:,}원 (이격: {r['disp_daily_30']}%)\n"
         msg += f"   - 50일거래비: {r['vol_ratio_sma50']}% [{bar}] | 일봉거래: {r['vol_today']:,}주 (전일비: {r['vol_ratio_prev']}%)\n\n"
 else:
     msg += "오늘 조건을 충족하는 종목이 없습니다."
